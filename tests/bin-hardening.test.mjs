@@ -1,0 +1,362 @@
+// Hardening tests for bin/dsh-superpowers.mjs — contract items H11a, H11b, H11c, I-A, I-B, B1-B4.
+// I-A/I-B replaced H12 (the proxy-retry contract) when the plugin stopped owning any
+// proxy surface: routing belongs to the invoking environment, never to this plugin.
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { listSkillDirs } from '../bin/dsh-superpowers.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const BIN = join(HERE, '..', 'bin', 'dsh-superpowers.mjs');
+
+/** Run the real CLI through node and capture stdout/stderr/status. */
+function runCli(args) {
+  return spawnSync(process.execPath, [BIN, ...args], { encoding: 'utf8' });
+}
+
+/** Run real git in a fixture with commit/tag signing pinned off (F1 pattern). */
+function runGit(args, cwd) {
+  return spawnSync(
+    'git',
+    ['-c', 'commit.gpgsign=false', '-c', 'tag.gpgsign=false', ...args],
+    { cwd, encoding: 'utf8' },
+  );
+}
+
+/** A vendor-ish directory that EXISTS, contains skills, but is not a git checkout. */
+function makeNonGitVendorFixture() {
+  const vendorDir = mkdtempSync(join(tmpdir(), 'dsh-bin-vendor-'));
+  const skillsDir = join(vendorDir, 'skills');
+  for (const name of ['alpha', 'beta']) {
+    mkdirSync(join(skillsDir, name), { recursive: true });
+    writeFileSync(
+      join(skillsDir, name, 'SKILL.md'),
+      '---' + String.fromCharCode(10) + 'name: ' + name + String.fromCharCode(10) +
+        'description: ' + name + ' skill' + String.fromCharCode(10) + '---' + String.fromCharCode(10) + 'body' + String.fromCharCode(10),
+    );
+  }
+  return vendorDir;
+}
+
+// ---------------------------------------------------------------------------
+// H11a — listSkillDirs must skip dot-directories (match lib discoverSkills)
+// ---------------------------------------------------------------------------
+
+test('H11a listSkillDirs skips dot-directories', () => {
+  const skillsDir = mkdtempSync(join(tmpdir(), 'dsh-bin-list-'));
+  try {
+    for (const name of ['alpha', 'beta']) {
+      mkdirSync(join(skillsDir, name), { recursive: true });
+      writeFileSync(
+        join(skillsDir, name, 'SKILL.md'),
+        '---' + String.fromCharCode(10) + 'name: ' + name + String.fromCharCode(10) +
+          'description: ' + name + ' skill' + String.fromCharCode(10) + '---' + String.fromCharCode(10) + 'body' + String.fromCharCode(10),
+      );
+    }
+    mkdirSync(join(skillsDir, '.hidden'), { recursive: true });
+    writeFileSync(
+      join(skillsDir, '.hidden', 'SKILL.md'),
+      '---' + String.fromCharCode(10) + 'name: hidden' + String.fromCharCode(10) +
+        'description: hidden skill' + String.fromCharCode(10) + '---' + String.fromCharCode(10) + 'body' + String.fromCharCode(10),
+    );
+
+    const names = listSkillDirs(skillsDir);
+
+    assert.ok(names.includes('alpha') && names.includes('beta'), 'normal skill dirs are still listed: ' + JSON.stringify(names));
+    assert.ok(!names.includes('.hidden'), 'dot-directories must be skipped: ' + JSON.stringify(names));
+    assert.deepEqual(names.filter((name) => name.startsWith('.')), [], 'no dot-entry may be listed: ' + JSON.stringify(names));
+  } finally {
+    rmSync(skillsDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// H11b — status must distinguish "path exists" from "is a git checkout"
+// ---------------------------------------------------------------------------
+
+test('H11b status says exists: yes for an existing non-git directory that holds skills', () => {
+  const vendorDir = makeNonGitVendorFixture();
+  try {
+    const result = runCli(['status', '--dir', vendorDir]);
+
+    assert.equal(result.status, 0, 'status exits 0: stderr=' + result.stderr);
+    assert.match(result.stdout, /^skill dirs: [1-9][0-9]*$/m, 'fixture skill dirs are counted: ' + result.stdout);
+    const claimsAbsent = /^exists: no$/m.test(result.stdout);
+    const nonZeroSkills = /^skill dirs: [1-9][0-9]*$/m.test(result.stdout);
+    assert.ok(
+      !(claimsAbsent && nonZeroSkills),
+      'the misleading "exists: no" next to a non-zero skill dir count must be gone: ' + result.stdout,
+    );
+    assert.match(result.stdout, /^exists: yes$/m, 'exists: reports path existence, not git-ness: ' + result.stdout);
+  } finally {
+    rmSync(vendorDir, { recursive: true, force: true });
+  }
+});
+
+test('H11b status prints a separate git: yes/no line for checkout vs plain directory', () => {
+  const vendorDir = makeNonGitVendorFixture();
+  try {
+    const plain = runCli(['status', '--dir', vendorDir]);
+    assert.equal(plain.status, 0, 'status exits 0: stderr=' + plain.stderr);
+    assert.match(plain.stdout, /^git: no$/m, 'a plain directory is not a git checkout: ' + plain.stdout);
+
+    const real = runCli(['status']);
+    assert.equal(real.status, 0, 'status on the real vendor dir exits 0: stderr=' + real.stderr);
+    assert.match(real.stdout, /^git: yes$/m, 'the real vendor dir is a git checkout: ' + real.stdout);
+  } finally {
+    rmSync(vendorDir, { recursive: true, force: true });
+  }
+});
+
+test('H11b status keeps the exists:, tag:, and skill dirs: lines on the real vendor dir (I5)', () => {
+  const result = runCli(['status']);
+
+  assert.equal(result.status, 0, 'status exits 0: stderr=' + result.stderr);
+  assert.match(result.stdout, /^exists: yes$/m, 'real vendor dir exists: ' + result.stdout);
+  assert.match(result.stdout, /tag: v6\.3\.0/, 'tag line survives: ' + result.stdout);
+  assert.match(result.stdout, /skill dirs: 14/, 'skill dirs line survives: ' + result.stdout);
+});
+
+// ---------------------------------------------------------------------------
+// B1 — the count line is labelled "skill dirs:" so it cannot be read as the
+//      catalogue size (which additionally requires a description)
+// ---------------------------------------------------------------------------
+
+test('B1 status prints "skill dirs: <n>" and never the old "skill count:" label', () => {
+  const vendorDir = makeNonGitVendorFixture();
+  try {
+    const result = runCli(['status', '--dir', vendorDir]);
+
+    assert.equal(result.status, 0, 'status exits 0: ' + result.stderr);
+    assert.match(result.stdout, /^skill dirs: 2$/m, 'both fixture dirs are counted under the new label: ' + result.stdout);
+    assert.doesNotMatch(result.stdout, /skill count/, 'the ambiguous old label is gone: ' + result.stdout);
+  } finally {
+    rmSync(vendorDir, { recursive: true, force: true });
+  }
+});
+// ---------------------------------------------------------------------------
+// B2 — an existing but unreadable skills directory is named on stderr (status stays 0)
+// ---------------------------------------------------------------------------
+
+test('B2 an unreadable skills directory is named on stderr while status still exits 0', () => {
+  const vendorDir = mkdtempSync(join(tmpdir(), 'dsh-bin-unreadable-'));
+  const skillsDir = join(vendorDir, 'skills');
+  mkdirSync(skillsDir, { recursive: true });
+  chmodSync(skillsDir, 0o000);
+  try {
+    const result = runCli(['status', '--dir', vendorDir]);
+
+    assert.equal(result.status, 0, 'status stays informational (exit 0): ' + result.stderr);
+    assert.match(result.stdout, /^skill dirs: 0$/m, 'the count line is still printed: ' + result.stdout);
+    assert.match(
+      result.stderr,
+      /^dsh-superpowers: skills directory unreadable at /m,
+      'stderr names the unreadable skills directory: ' + result.stderr,
+    );
+    assert.ok(result.stderr.includes(skillsDir), 'the diagnostic names the exact directory: ' + result.stderr);
+    assert.match(result.stderr, /EACCES|permission denied/i, 'the diagnostic carries the cause: ' + result.stderr);
+  } finally {
+    chmodSync(skillsDir, 0o755);
+    rmSync(vendorDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// B3 — a failed tag read is named on stderr, so it is distinguishable from a
+//      repository that merely has no tags
+// ---------------------------------------------------------------------------
+
+test('B3 a failed git describe prints tag: n/a plus an stderr cause, unlike a tagless repository', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-bin-describe-'));
+  const broken = join(root, 'broken');
+  const tagless = join(root, 'tagless');
+  try {
+    // (a) a directory holding an empty .git: isGitCheckout() says yes, describe fails.
+    mkdirSync(join(broken, '.git'), { recursive: true });
+    const failed = runCli(['status', '--dir', broken]);
+
+    assert.equal(failed.status, 0, 'status stays informational (exit 0): ' + failed.stderr);
+    assert.match(failed.stdout, /^git: yes$/m, 'a bare .git still reads as a checkout: ' + failed.stdout);
+    assert.match(failed.stdout, /^tag: n\/a$/m, 'the n/a tag line is kept: ' + failed.stdout);
+    assert.match(
+      failed.stderr,
+      /^dsh-superpowers: could not read the tag in /m,
+      'stderr names the failed tag read: ' + failed.stderr,
+    );
+    assert.ok(failed.stderr.includes(broken), 'the diagnostic names the checkout: ' + failed.stderr);
+    assert.match(failed.stderr, /not a git repository|fatal/i, 'the diagnostic carries the cause: ' + failed.stderr);
+
+    // (b) a real repository with a commit but no tags: describe --always succeeds,
+    // so the tag line differs and no diagnostic is printed.
+    mkdirSync(tagless, { recursive: true });
+    assert.equal(runGit(['init'], tagless).status, 0, 'tagless repository initialised');
+    runGit(['config', 'user.email', 't@example.com'], tagless);
+    runGit(['config', 'user.name', 't'], tagless);
+    writeFileSync(join(tagless, 'f.txt'), 'a');
+    runGit(['add', 'f.txt'], tagless);
+    assert.equal(runGit(['commit', '-m', 'a'], tagless).status, 0, 'tagless repository has a commit');
+
+    const quiet = runCli(['status', '--dir', tagless]);
+
+    assert.equal(quiet.status, 0, 'status exits 0: ' + quiet.stderr);
+    assert.match(quiet.stdout, /^tag: [0-9a-f]{7,}$/m, 'a tagless repository reports its commit, not n/a: ' + quiet.stdout);
+    assert.doesNotMatch(quiet.stderr, /could not read the tag/, 'no diagnostic when describe succeeds: ' + quiet.stderr);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// B4 — the tag-resolution failure names the directory instead of asserting a
+//      cause ("no tags found") that it has not established
+// ---------------------------------------------------------------------------
+
+test('B4 the tag-resolution failure names the directory and does not claim "no tags found"', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-bin-notagfail-'));
+  try {
+    const remote = join(root, 'remote');
+    mkdirSync(remote);
+    assert.equal(runGit(['init', '--bare', remote], root).status, 0, 'bare remote created');
+    const work = join(root, 'work');
+    assert.equal(runGit(['clone', remote, work], root).status, 0, 'work clone created');
+    runGit(['config', 'user.email', 't@example.com'], work);
+    runGit(['config', 'user.name', 't'], work);
+    writeFileSync(join(work, 'f.txt'), 'a');
+    runGit(['add', 'f.txt'], work);
+    assert.equal(runGit(['commit', '-m', 'a'], work).status, 0, 'commit created');
+    assert.equal(runGit(['push', 'origin', 'HEAD'], work).status, 0, 'commit pushed');
+    const vendor = join(root, 'vendor');
+    assert.equal(runGit(['clone', remote, vendor], root).status, 0, 'vendor clone created');
+
+    const result = runCli(['update-skills', '--dir', vendor]);
+
+    assert.equal(result.status, 1, 'a checkout with no tags fails: ' + result.stdout + result.stderr);
+    assert.match(result.stderr, /could not resolve the newest tag from /, 'the message names the failed operation: ' + result.stderr);
+    assert.ok(result.stderr.includes(vendor), 'the message names the directory: ' + result.stderr);
+    assert.doesNotMatch(result.stderr, /no tags found/, 'it must not assert a cause it has not established: ' + result.stderr);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+// ---------------------------------------------------------------------------
+// H11c — '-h'/'--help' anywhere in argv prints usage on stdout and exits 0
+// ---------------------------------------------------------------------------
+
+test("H11c 'status --help' prints usage on stdout and exits 0", () => {
+  const result = runCli(['status', '--help']);
+
+  assert.equal(result.status, 0, "'status --help' must exit 0: stderr=" + result.stderr);
+  assert.match(result.stdout, /Usage:/, 'usage is printed on stdout: ' + result.stdout);
+  assert.doesNotMatch(result.stderr, /Usage:/, 'usage must not be printed on stderr: ' + result.stderr);
+});
+
+test("H11c '--help' prints usage on stdout and exits 0", () => {
+  const result = runCli(['--help']);
+
+  assert.equal(result.status, 0, "'--help' must exit 0: stderr=" + result.stderr);
+  assert.match(result.stdout, /Usage:/, 'usage is printed on stdout: ' + result.stdout);
+  assert.doesNotMatch(result.stderr, /Usage:/, 'usage must not be printed on stderr: ' + result.stderr);
+});
+
+test('H11c malformed argv still exits 2 (I6)', () => {
+  const cases = [
+    { args: [], label: 'missing command' },
+    { args: ['bogus'], label: 'unknown command' },
+    { args: ['status', 'extra'], label: 'unexpected extra argument' },
+    { args: ['--dir'], label: '--dir without a value' },
+    { args: ['status', '--bogus'], label: 'unknown option' },
+  ];
+
+  for (const { args, label } of cases) {
+    const result = runCli(args);
+    assert.equal(
+      result.status,
+      2,
+      label + ' ' + JSON.stringify(args) + ' must exit 2: stdout=' + result.stdout + ' stderr=' + result.stderr,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// I-A — the CLI owns no proxy surface at all
+// ---------------------------------------------------------------------------
+
+const MODULE_EXPORTS_READER =
+  'import * as mod from ' + JSON.stringify(pathToFileURL(BIN).href) + ';' + String.fromCharCode(10) +
+  'process.stdout.write(JSON.stringify(Object.keys(mod)));' + String.fromCharCode(10);
+
+test('I-A the CLI exposes no proxy surface and reads no proxy variable', () => {
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', MODULE_EXPORTS_READER], {
+    encoding: 'utf8',
+    env: { ...process.env, DSH_SUPERPOWERS_PROXY: 'http://knob.invalid:2' },
+  });
+  assert.equal(child.status, 0, 'child could not import the bin: ' + child.stderr);
+
+  const proxied = JSON.parse(child.stdout).filter((name) => /proxy/i.test(name));
+  assert.deepEqual(proxied, [], 'the bin exports no proxy-shaped name');
+
+  const mentions = readFileSync(BIN, 'utf8')
+    .split(/\r?\n/)
+    .map((line, index) => index + 1 + ': ' + line)
+    .filter((line) => /proxy/i.test(line));
+  assert.deepEqual(mentions, [], 'the bin source mentions no proxy');
+});
+
+// ---------------------------------------------------------------------------
+// I-B — a failing git step runs exactly once, with the inherited environment
+// ---------------------------------------------------------------------------
+
+test('I-B a failing git step runs once with the inherited environment (no proxy retry)', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-fakegit-'));
+  try {
+    const shimDir = join(root, 'shim');
+    mkdirSync(shimDir);
+    const logPath = join(root, 'git-calls.log');
+    const shimPath = join(shimDir, 'git');
+    // A fake git that records the subcommand and the proxy variables it received,
+    // then fails every fetch so a second attempt would show up as a second line.
+    writeFileSync(shimPath, [
+      '#!/bin/sh',
+      'printf "%s|%s|%s|%s\\n" "$1" "$HTTPS_PROXY" "$HTTP_PROXY" "$DSH_SUPERPOWERS_PROXY" >> "$GIT_SHIM_LOG"',
+      '[ "$1" = "fetch" ] && exit 1',
+      'exit 0',
+      '',
+    ].join(String.fromCharCode(10)));
+    chmodSync(shimPath, 0o755);
+
+    // An existing checkout, so updateSkills goes straight to fetch (no clone).
+    const vendorDir = join(root, 'vendor');
+    mkdirSync(join(vendorDir, '.git'), { recursive: true });
+
+    const result = spawnSync(process.execPath, [BIN, 'update-skills', '--dir', vendorDir], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: shimDir + ':' + process.env.PATH,
+        GIT_SHIM_LOG: logPath,
+        HTTPS_PROXY: 'http://inherited.invalid:1',
+        HTTP_PROXY: 'http://inherited.invalid:1',
+        DSH_SUPERPOWERS_PROXY: 'http://knob.invalid:2',
+      },
+    });
+
+    assert.equal(result.status, 1, 'a failed fetch exits 1: ' + result.stdout + result.stderr);
+
+    const calls = readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean).map((line) => line.split('|'));
+    const fetches = calls.filter((parts) => parts[0] === 'fetch');
+    assert.equal(fetches.length, 1, 'fetch is attempted exactly once: ' + JSON.stringify(calls));
+    assert.deepEqual(
+      [...new Set(fetches.map((parts) => parts[1]))],
+      ['http://inherited.invalid:1'],
+      'the git child inherits HTTPS_PROXY unchanged and never the knob value',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -1,0 +1,35 @@
+{
+  "name": "dsh-superpowers",
+  "version": "0.1.0",
+  "description": "Superpowers skills port for DSH: plugin-registered skill provider + assembly-time system-prompt bootstrap section",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "bin": {
+    "dsh-superpowers": "bin/dsh-superpowers.mjs"
+  },
+  "files": [
+    "lib/",
+    "bin/",
+    "references/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "update-skills": "node bin/dsh-superpowers.mjs update-skills",
+    "status": "node bin/dsh-superpowers.mjs status"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}

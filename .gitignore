@@ -1,0 +1,6 @@
+# The vendored upstream checkout is managed by this plugin's own update-skills
+# command and is a git checkout in its own right.
+vendor/
+
+# A worktree created inside the repo must never be committed.
+.worktrees/
