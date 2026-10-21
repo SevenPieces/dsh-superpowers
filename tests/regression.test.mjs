@@ -1188,3 +1188,239 @@ test('AR-2: a below-cap newline-dense replay completes through the real CLI', { 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Round 10 (R9-1, R9-2, R9-4, R9-6): partial-clone cleanup, direct-library
+// EPIPE, U+FFFD diagnostics, and a 16 MiB tag listing.
+// ---------------------------------------------------------------------------
+
+/**
+ * A bare remote whose tags point at a parent commit and whose tag list contains
+ * a raw 0xFF ref plus the valid-UTF-8 U+FFFD twin it decodes to. The branch tip
+ * is a different commit, so a silent tag checkout moves HEAD and is observable.
+ */
+function makeFffdTwinRemote(root) {
+  mkdirSync(root, { recursive: true });
+  const remote = join(root, 'remote');
+  mkdirSync(remote);
+  assert.equal(runGit(['init', '--bare', remote]).status, 0, 'bare remote created');
+  const work = join(root, 'work');
+  assert.equal(runGit(['clone', remote, work]).status, 0, 'work clone created');
+  runGit(['config', 'user.email', 't@example.com'], work);
+  runGit(['config', 'user.name', 't'], work);
+  writeFileSync(join(work, 'f.txt'), 'a');
+  runGit(['add', 'f.txt'], work);
+  assert.equal(runGit(['commit', '-m', 'a'], work).status, 0, 'tag target commit created');
+  const taggedSha = runGit(['rev-parse', 'HEAD'], work).stdout.trim();
+  writeFileSync(join(work, 'f.txt'), 'b');
+  runGit(['add', 'f.txt'], work);
+  assert.equal(runGit(['commit', '-m', 'b'], work).status, 0, 'branch tip commit created');
+  assert.equal(runGit(['push', 'origin', 'HEAD'], work).status, 0, 'branch pushed');
+
+  const twin = 'v2.0.0' + String.fromCharCode(0xfffd);
+  assert.equal(runGit(['update-ref', 'refs/tags/' + twin, taggedSha], work).status, 0, 'U+FFFD twin tag created');
+  const payload = Buffer.concat([
+    Buffer.from('create refs/tags/v2.0.0'),
+    Buffer.from([0xff]),
+    Buffer.from(' ' + taggedSha + LF),
+  ]);
+  const raw = spawnSync(
+    'git',
+    ['-c', 'commit.gpgsign=false', '-c', 'tag.gpgsign=false', 'update-ref', '--stdin'],
+    { cwd: work, input: payload },
+  );
+  assert.equal(raw.status, 0, 'non-UTF-8 tag created: ' + raw.stderr.toString());
+  assert.equal(
+    runGit(['push', '--quiet', 'origin', 'refs/tags/*:refs/tags/*'], work).status,
+    0,
+    'both tags pushed',
+  );
+  return { remote, url: pathToFileURL(remote).href, twin, work };
+}
+
+test('R9-1: a failed first-run clone removes the partial directory so a retry re-clones', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-partial-'));
+  try {
+    const shimDir = join(root, 'shim');
+    mkdirSync(shimDir);
+    const shimPath = join(shimDir, 'git');
+    // Emulate a clone that creates a partial checkout, then fails.
+    writeFileSync(
+      shimPath,
+      '#!/bin/sh' + LF +
+        'mkdir -p "$VENDOR_DIR/.git"' + LF +
+        'echo partial > "$VENDOR_DIR/partial.txt"' + LF +
+        'exit 1' + LF,
+    );
+    chmodSync(shimPath, 0o755);
+    const vendor = join(root, 'fresh', 'vendor');
+
+    withPatchedEnv({ PATH: shimDir + ':' + process.env.PATH, VENDOR_DIR: vendor }, () => {
+      assert.throws(
+        () => updateSkills(vendor, 'file://' + join(root, 'nope.git')),
+        /git clone failed/,
+        'the first clone fails',
+      );
+    });
+    assert.equal(existsSync(vendor), false, 'the plugin-created partial vendor directory is removed');
+
+    const goodRoot = join(root, 'good');
+    mkdirSync(goodRoot, { recursive: true });
+    const { url } = makeTaggedBareRemote(goodRoot);
+    assert.equal(updateSkills(vendor, url), 0, 'a retry after the failure re-clones and succeeds');
+    assert.equal(
+      stripTrailingNewlines(runGit(['describe', '--tags'], vendor).stdout),
+      'v2.0.0',
+      'the retry checks out the newest tag',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('R9-2: direct library callers tolerate EPIPE from a closed stdout reader', { skip: process.platform === 'win32' }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-lib-epipe-'));
+  try {
+    const shimDir = join(root, 'shim');
+    mkdirSync(shimDir);
+    const shimPath = join(shimDir, 'git');
+    writeFileSync(shimPath, '#!/bin/sh' + LF + 'yes A | head -c 2097152' + LF + 'exit 1' + LF);
+    chmodSync(shimPath, 0o755);
+
+    const binUrl = pathToFileURL(join(PLUGIN_DIR, 'bin', 'dsh-superpowers.mjs')).href;
+    const script = [
+      'import { updateSkills } from ' + JSON.stringify(binUrl) + ';',
+      'try { updateSkills(process.env.VENDOR_DIR, process.env.REMOTE_URL); process.exitCode = 0; }',
+      'catch (error) { console.error("MARKER:CAUGHT:" + (error && error.message)); process.exitCode = 7; }',
+    ].join(LF);
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+      env: {
+        ...process.env,
+        PATH: shimDir + ':' + process.env.PATH,
+        VENDOR_DIR: join(root, 'vendor'),
+        REMOTE_URL: 'file://' + join(root, 'nope.git'),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.stdout.on('error', () => {}); // the parent read side closing is expected
+    child.stdout.destroy();
+
+    const [code] = await once(child, 'close');
+
+    assert.equal(code, 7, 'the library caller caught the git failure cleanly: ' + JSON.stringify(stderr.slice(0, 300)));
+    assert.ok(
+      stderr.includes('MARKER:CAUGHT:git clone failed'),
+      'the caught error is the git failure, not an EPIPE crash: ' + JSON.stringify(stderr.slice(0, 300)),
+    );
+    assert.ok(!stderr.includes('EPIPE'), 'no EPIPE reaches stderr: ' + JSON.stringify(stderr.slice(0, 400)));
+    assert.ok(!stderr.includes("Unhandled 'error' event"), 'no unhandled stream error event');
+    assert.doesNotMatch(stderr, /^\s+at .*node:/m, 'no Node-internal stream stack');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('R9-4: the U+FFFD refusal names the offending tag', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-fffd-message-'));
+  try {
+    const { url } = makeFffdTwinRemote(root);
+    const vendor = join(root, 'fresh', 'vendor');
+
+    assert.throws(
+      () => updateSkills(vendor, url),
+      (error) => {
+        assert.ok(error instanceof Error, 'a U+FFFD tag fails closed');
+        assert.match(
+          error.message,
+          /U\+FFFD|replacement|invalid.*utf-?8|utf-?8/i,
+          'the refusal explains the U+FFFD decoding problem: ' + error.message,
+        );
+        assert.ok(
+          error.message.includes('v2.0.0'),
+          'the refusal names the offending tag: ' + error.message,
+        );
+        return true;
+      },
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('R9-4: status diagnoses a describe tag that contains U+FFFD', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-fffd-status-'));
+  try {
+    const repo = join(root, 'repo');
+    mkdirSync(repo);
+    assert.equal(runGit(['init'], repo).status, 0, 'repo initialised');
+    runGit(['config', 'user.email', 't@example.com'], repo);
+    runGit(['config', 'user.name', 't'], repo);
+    writeFileSync(join(repo, 'f.txt'), 'a');
+    runGit(['add', 'f.txt'], repo);
+    assert.equal(runGit(['commit', '-m', 'a'], repo).status, 0, 'commit created');
+    const twin = 'v2.0.0' + String.fromCharCode(0xfffd);
+    assert.equal(runGit(['update-ref', 'refs/tags/' + twin, 'HEAD'], repo).status, 0, 'U+FFFD tag created');
+    assert.equal(runGit(['checkout', '--force', 'refs/tags/' + twin], repo).status, 0, 'tag checked out');
+
+    const result = spawnSync(
+      process.execPath,
+      [join(PLUGIN_DIR, 'bin', 'dsh-superpowers.mjs'), 'status', '--dir', repo],
+      { encoding: 'utf8' },
+    );
+
+    assert.equal(result.status, 0, 'status stays informational (exit 0): ' + result.stderr);
+    assert.match(
+      result.stderr,
+      /U\+FFFD|replacement|invalid.*utf-?8/i,
+      'status diagnoses the U+FFFD tag on stderr: ' + result.stderr,
+    );
+    assert.ok(result.stderr.includes('v2.0.0'), 'the diagnostic names the tag: ' + result.stderr);
+    assert.match(result.stdout, /^tag: /m, 'the informational tag line is still printed: ' + result.stdout);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('R9-6: a 16 MiB tag listing still completes and selects its first line', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-16m-tags-'));
+  try {
+    const shimDir = join(root, 'shim');
+    mkdirSync(shimDir);
+    const logPath = join(root, 'git-calls.log');
+    const vendor = join(root, 'vendor');
+    writeFileSync(
+      join(shimDir, 'git'),
+      [
+        '#!/bin/sh',
+        'case "$1" in',
+        '  clone) mkdir -p "$VENDOR_DIR/.git"; exit 0 ;;',
+        '  fetch|checkout) echo "$@" >> "$GIT_LOG"; exit 0 ;;',
+        '  tag) echo v9.9.9; yes x | head -c 16777209; exit 0 ;;',
+        '  rev-list) echo 0123456789abcdef0123456789abcdef01234567; exit 0 ;;',
+        'esac',
+        'exit 0',
+        '',
+      ].join(LF),
+    );
+    chmodSync(join(shimDir, 'git'), 0o755);
+
+    let elapsed = 0;
+    withPatchedEnv({ PATH: shimDir + ':' + process.env.PATH, VENDOR_DIR: vendor, GIT_LOG: logPath }, () => {
+      const started = Date.now();
+      assert.equal(updateSkills(vendor, 'file://' + join(root, 'nope.git')), 0, 'the 16 MiB listing resolves');
+      elapsed = Date.now() - started;
+    });
+
+    const calls = readFileSync(logPath, 'utf8').trim().split(LF);
+    assert.ok(
+      calls.some((line) => /checkout --force refs\/tags\/v9\.9\.9$/.test(line)),
+      'the first line of the 16 MiB listing is selected: ' + JSON.stringify(calls.slice(0, 5)),
+    );
+    assert.ok(elapsed < 15000, 'the listing completes in reasonable time; elapsed ' + elapsed + 'ms');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -17,7 +17,7 @@
 // The vendored tree is never edited by this command; it only clones/fetches/checks out.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -349,6 +349,40 @@ function stripTrailingNewlines(text) {
 }
 
 /**
+ * Return the first non-empty line of a captured tag listing without splitting
+ * the whole text. Only CR/LF terminators are stripped: trailing characters in
+ * a legal ref name are preserved verbatim.
+ * @param {string | null | undefined} text - captured `git tag` output.
+ * @returns {string} the first tag name, or '' when the listing is empty.
+ */
+function firstTagLine(text) {
+  if (typeof text !== 'string' || text === '') return '';
+  const length = text.length;
+  let start = 0;
+  while (start < length) {
+    const lf = text.indexOf('\n', start);
+    const lineEnd = lf === -1 ? length : lf;
+    let end = lineEnd;
+    if (end > start && text.charCodeAt(end - 1) === 0x0d) end -= 1;
+    if (end > start) return text.slice(start, end);
+    if (lf === -1) break;
+    start = lf + 1;
+  }
+  return '';
+}
+
+/**
+ * Render a tag name for a diagnostic: control/bidi characters are escaped and
+ * U+FFFD is spelled out, because it signals a decoding replacement rather than
+ * a character that was really in the ref name.
+ * @param {string} tag - selected or described tag name.
+ * @returns {string} the diagnostic display form.
+ */
+function escapeTagName(tag) {
+  return escapeControlChars(tag).split('\uFFFD').join('\\u{fffd}');
+}
+
+/**
  * Run git with captured streams and replay the output through
  * escapeControlChars. Capture is bounded by GIT_MAX_BUFFER_BYTES: a large
  * legitimate tag set is accepted, while output past the bound fails closed.
@@ -457,6 +491,7 @@ function gitFailureCause(result) {
  * @returns {number} 0 on success; throws on any failed or timed-out git step.
  */
 export function updateSkills(vendorDir, repoUrl = REPO_URL) {
+  installStreamErrorHandlers();
   if (typeof repoUrl !== 'string' || repoUrl.trim() === '') {
     fail('repoUrl must be a non-empty string')
   }
@@ -472,10 +507,19 @@ export function updateSkills(vendorDir, repoUrl = REPO_URL) {
   }
 
   if (!isGitCheckout(vendorDir)) {
+    const existedBefore = existsSync(vendorDir);
     mkdirSync(dirname(vendorDir), { recursive: true });
     console.error(`[dsh-superpowers] cloning ${safeCloneUrl} -> ${safeVendorDir}`);
     const clone = runGit(['clone', '--depth', '1', '--', cloneUrl, vendorDir], dirname(vendorDir));
     if (clone.status !== 0) {
+      // A failed first-run clone can leave a partial target behind; remove it
+      // only when this run created the directory, so a retry can re-clone and a
+      // pre-existing directory is never destroyed.
+      if (!existedBefore) {
+        try {
+          rmSync(vendorDir, { recursive: true, force: true });
+        } catch { /* best effort: the clone failure below is the real diagnostic */ }
+      }
       fail(`git clone failed (${gitFailureCause(clone)}) for ${safeCloneUrl}`);
     }
   }
@@ -487,21 +531,19 @@ export function updateSkills(vendorDir, repoUrl = REPO_URL) {
   }
 
   // --no-column keeps a user's column.ui/column.tag config from turning the
-  // listing into columns; the tag is parsed as exactly one line.
+  // listing into columns; the first line is read raw, without a split array.
   const tagList = runGitCapture(['tag', '--no-column', '--sort=-v:refname'], vendorDir);
-  // Split on CRLF/LF and take the first non-empty line verbatim: trimming a
-  // legal ref name that ends in a Unicode space would corrupt it.
-  const tag = (tagList.stdout ?? '').split(/\r?\n/).find((line) => line !== '') ?? '';
+  const tag = firstTagLine(tagList.stdout);
   if (tagList.status !== 0 || tag === '') {
     fail(`could not resolve the newest tag from ${safeVendorDir} (${gitFailureCause(tagList)})`);
   }
+  const safeTag = escapeControlChars(tag);
   // Node decodes git's byte-named refs as UTF-8 with replacement. A U+FFFD in
   // the selected tag means the real ref name is ambiguous (another ref can
   // decode to the same string), so refuse instead of checking out a wrong ref.
   if (tag.includes('\uFFFD')) {
-    fail(`could not resolve the newest tag from ${safeVendorDir}: the selected tag name is not valid UTF-8 (decoded with U+FFFD); refusing to check out a possibly wrong ref`);
+    fail(`could not resolve the newest tag from ${safeVendorDir}: the selected tag ${escapeTagName(tag)} decodes with U+FFFD (invalid UTF-8 or a literal replacement character); refusing to check out a possibly wrong ref`);
   }
-  const safeTag = escapeControlChars(tag);
 
   const tagRef = 'refs/tags/' + tag;
   const rev = runGitCapture(['rev-list', '-n', '1', tagRef], vendorDir);
@@ -527,6 +569,7 @@ export function updateSkills(vendorDir, repoUrl = REPO_URL) {
  * "dsh-superpowers: ..." diagnostics.
  */
 export function status(vendorDir) {
+  installStreamErrorHandlers();
   const safeVendorDir = escapeControlChars(vendorDir);
   const pathExists = existsSync(vendorDir);
   const isGit = isGitCheckout(vendorDir);
@@ -535,6 +578,10 @@ export function status(vendorDir) {
     const described = runGitCapture(['describe', '--tags', '--always'], vendorDir);
     if (described.status === 0) {
       tag = stripTrailingNewlines(described.stdout) || null;
+      if (tag !== null && tag.includes('\uFFFD')) {
+        console.error(`dsh-superpowers: could not read the tag in ${safeVendorDir} (tag name ${escapeTagName(tag)} decodes with U+FFFD; ignoring it)`);
+        tag = null;
+      }
     } else {
       // Keep the n/a line, but say why: a failed describe is not "no tags".
       console.error(`dsh-superpowers: could not read the tag in ${safeVendorDir} (${gitFailureCause(described)})`);
