@@ -6,7 +6,7 @@ A standalone out-of-tree DSH plugin that ports the superpowers skill library:
 
 Runtime source is vendor-only and independent of any other harness install.
 
-Tested with DSH 0.1.5-rc.1.
+Tested with dsh-v0.2.1-rc.2
 
 ## Install
 
