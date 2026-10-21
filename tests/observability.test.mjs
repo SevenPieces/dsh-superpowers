@@ -4,6 +4,9 @@
  *      one and from invalid UTF-8, and never serves U+FFFD.
  *  E — control characters in a skill entry name are escaped, so a hostile
  *      directory name cannot forge warning lines.
+ *  R1 — every diagnostic that interpolates a path or an error message is
+ *      escaped too: a crafted path, a hostile getter or a config path must not
+ *      forge a log line.
  *
  * These are fail-open diagnostics contracts: the catalog must never silently
  * mislabel a file, and a log line must stay one line.
@@ -15,6 +18,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  apply,
   composeBootstrap,
   createBootstrapProvider,
   createSkillsProvider,
@@ -24,6 +28,9 @@ import {
 const LF = String.fromCharCode(10)
 const ESC = String.fromCharCode(27)
 const BACKSLASH = String.fromCharCode(92)
+const ESCAPED_NEWLINE = BACKSLASH + 'n'
+const BIDI_OVERRIDE = String.fromCharCode(0x202e)
+const ESCAPED_BIDI = BACKSLASH + 'u{' + '202e' + '}'
 const REPLACEMENT = String.fromCharCode(0xfffd)
 // C0 controls, DEL, and C1 controls: a warning line must carry none of these raw.
 const CONTROL = new RegExp(
@@ -226,7 +233,7 @@ test('E: control characters in a skill entry name are escaped, never forged into
   const root = makeTempDir()
   const skillsDir = join(root, 'skills')
   const forged = 'dsh-superpowers: FORGED LINE'
-  const evilName = 'evil' + LF + forged + ESC + '[31mred'
+  const evilName = 'evil' + LF + forged + ESC + '[31mred' + BIDI_OVERRIDE + 'gnp.exe'
   try {
     // No SKILL.md, so the entry is skipped and named in a warning.
     mkdirSync(join(skillsDir, evilName), { recursive: true })
@@ -253,6 +260,100 @@ test('E: control characters in a skill entry name are escaped, never forged into
       line.includes(BACKSLASH),
       'the control characters are escaped with a backslash rather than silently dropped: ' + JSON.stringify(line),
     )
+    // Round 2: bidi formatting controls are escaped too, so a right-to-left
+    // override cannot reorder a diagnostic line.
+    assert.ok(!line.includes(BIDI_OVERRIDE), 'the right-to-left override is escaped: ' + JSON.stringify(line))
+    assert.ok(line.includes(ESCAPED_BIDI), 'the bidi override is escaped in unicode form: ' + JSON.stringify(line))
+    assert.ok(line.includes('gnp.exe'), 'the filename after the override stays identifiable: ' + line)
+  } finally {
+    cleanup(root)
+  }
+})
+
+// ------------------------------------------------------------------ R1 (round 2)
+
+/** A provider over an empty tree whose warnings are collected. */
+function makeWarnProvider(root) {
+  const warns = []
+  const provider = createSkillsProvider(
+    { skillsDir: join(root, 'skills'), providerName: 'superpowers', rank: 600 },
+    { warn: (message) => warns.push(message) },
+  )
+  return { provider, warns }
+}
+
+test('R1: provider.get escapes a newline-bearing candidate path in its warning', async () => {
+  const root = makeTempDir()
+  try {
+    const { provider, warns } = makeWarnProvider(root)
+    // A missing body whose path carries a newline and an ESC sequence.
+    const evilPath = join(root, 'missing', 'evil' + LF + 'dsh-superpowers: FORGED' + ESC + '[31m', 'SKILL.md')
+    const candidate = { name: 'evil', description: 'x', path: evilPath, locator: join(root, 'missing') }
+
+    const definition = await provider.get(candidate, {})
+
+    assert.equal(definition, undefined, 'a missing body is never served')
+    const reported = warns.filter((message) => message.includes('skill body'))
+    assert.equal(reported.length, 1, 'exactly one body warning: ' + JSON.stringify(warns))
+    const line = reported[0]
+    assert.doesNotMatch(line, CONTROL, 'no raw control character reaches the warning: ' + JSON.stringify(line))
+    assert.equal(line.split(LF).length, 1, 'the warning stays one line')
+    assert.ok(line.includes(ESCAPED_NEWLINE), 'the newline is escaped, not dropped: ' + JSON.stringify(line))
+    assert.ok(line.includes('evil') && line.includes('FORGED'), 'the path stays identifiable after escaping: ' + line)
+  } finally {
+    cleanup(root)
+  }
+})
+
+test('R1: provider.get catches a throwing path getter and escapes its newline-bearing error', async () => {
+  const root = makeTempDir()
+  try {
+    const { provider, warns } = makeWarnProvider(root)
+    const candidate = {
+      name: 'hostile',
+      locator: join(root, 'skills', 'hostile'),
+      get path() {
+        throw new Error('path getter exploded' + LF + 'dsh-superpowers: FORGED')
+      },
+    }
+
+    const definition = await provider.get(candidate, {})
+
+    assert.equal(definition, undefined, 'a hostile candidate is contained, not served')
+    const reported = warns.filter((message) => message.includes('failed to load skill body'))
+    assert.equal(reported.length, 1, 'exactly one catch-all warning: ' + JSON.stringify(warns))
+    const line = reported[0]
+    assert.doesNotMatch(line, CONTROL, 'no raw control character reaches the warning: ' + JSON.stringify(line))
+    assert.equal(line.split(LF).length, 1, 'the warning stays one line')
+    assert.ok(line.includes(ESCAPED_NEWLINE), 'the error newline is escaped: ' + JSON.stringify(line))
+    assert.ok(line.includes('path getter exploded'), 'the cause stays identifiable: ' + line)
+    assert.ok(!new RegExp('^dsh-superpowers: FORGED', 'm').test(line), 'the forged text never starts a line')
+  } finally {
+    cleanup(root)
+  }
+})
+
+test('R1: apply() escapes a newline-bearing skillsDir in its info line', () => {
+  const root = makeTempDir()
+  try {
+    const skillsDir = join(root, 'skills' + LF + 'dsh-superpowers: FORGED' + ESC + '[31m')
+    const infos = []
+    const ctx = {
+      logger: { info: (message) => infos.push(message), warn: () => {} },
+      skills: { registerProvider: () => {} },
+      systemPrompt: { section: () => () => {} },
+      effect: (fn) => { const disposer = fn(); return () => { if (disposer) disposer() } },
+    }
+
+    apply(ctx, { skillsDir, toolMappingPath: join(root, 'missing-tools.md') })
+
+    const reported = infos.filter((message) => message.includes('skillsDir='))
+    assert.equal(reported.length, 1, 'the info line is emitted once: ' + JSON.stringify(infos))
+    const line = reported[0]
+    assert.doesNotMatch(line, CONTROL, 'no raw control character reaches the info line: ' + JSON.stringify(line))
+    assert.equal(line.split(LF).length, 1, 'the info line stays one line')
+    assert.ok(line.includes(ESCAPED_NEWLINE), 'the config newline is escaped: ' + JSON.stringify(line))
+    assert.ok(line.includes('dsh-superpowers: FORGED'), 'the forged text stays identifiable, only escaped: ' + line)
   } finally {
     cleanup(root)
   }

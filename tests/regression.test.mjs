@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -17,6 +17,38 @@ function runGit(args, cwd) {
     ['-c', 'commit.gpgsign=false', '-c', 'tag.gpgsign=false', ...args],
     { cwd, encoding: 'utf8' },
   );
+}
+
+/** Apply env overrides for the duration of fn, restoring every key afterwards. */
+function withPatchedEnv(patch, fn) {
+  const previous = {};
+  for (const key of Object.keys(patch)) previous[key] = process.env[key];
+  for (const key of Object.keys(patch)) {
+    if (patch[key] === undefined) delete process.env[key];
+    else process.env[key] = patch[key];
+  }
+  try {
+    return fn();
+  } finally {
+    for (const key of Object.keys(patch)) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+  }
+}
+
+/** A fake 'git' that records every invocation and fails, to prove no clone ran. */
+function makeRecordingGitShim(root) {
+  const shimDir = join(root, 'shim');
+  mkdirSync(shimDir);
+  const logPath = join(root, 'git-calls.log');
+  const shimPath = join(shimDir, 'git');
+  writeFileSync(
+    shimPath,
+    '#!/bin/sh' + LF + 'echo "$@" >> "$GIT_SHIM_LOG"' + LF + 'exit 1' + LF,
+  );
+  chmodSync(shimPath, 0o755);
+  return { shimDir, logPath };
 }
 
 /**
@@ -330,6 +362,115 @@ test('F2: updateSkills refuses an existing non-git vendor directory before cloni
     );
     assert.equal(existsSync(join(vendor, '.git')), false, 'no git checkout is created');
     assert.equal(readFileSync(join(vendor, 'keep.txt'), 'utf8'), 'do not overwrite', 'the directory is left intact');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// R2 (round 2): an option-like repoUrl must be rejected before any git step.
+// A recording shim proves no clone was even attempted.
+
+test('R2: updateSkills rejects an option-like repoUrl before any clone', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-repourl-'));
+  try {
+    const { shimDir, logPath } = makeRecordingGitShim(root);
+    const vendor = join(root, 'vendor');
+
+    withPatchedEnv({ PATH: shimDir + ':' + process.env.PATH, GIT_SHIM_LOG: logPath }, () => {
+      assert.throws(
+        () => updateSkills(vendor, '--bogus-option'),
+        (error) => {
+          assert.ok(error instanceof Error, 'an option-like repoUrl is rejected');
+          assert.match(error.message, /repoUrl/i, 'the error names the repoUrl parameter: ' + error.message);
+          assert.doesNotMatch(
+            error.message,
+            /git clone failed|fetch --tags/i,
+            'it is a validation error, not a clone failure: ' + error.message,
+          );
+          return true;
+        },
+      );
+    });
+
+    assert.equal(existsSync(logPath), false, 'no git process was started');
+    assert.equal(existsSync(vendor), false, 'no vendor directory was created');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('R2: updateSkills rejects a leading-whitespace option-like repoUrl before any clone', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-repourl-ws-'));
+  try {
+    const { shimDir, logPath } = makeRecordingGitShim(root);
+    const vendor = join(root, 'vendor');
+
+    withPatchedEnv({ PATH: shimDir + ':' + process.env.PATH, GIT_SHIM_LOG: logPath }, () => {
+      assert.throws(
+        () => updateSkills(vendor, '   --bogus-option'),
+        (error) => {
+          assert.ok(error instanceof Error, 'a whitespace-prefixed option-like repoUrl is rejected after trim');
+          assert.match(error.message, /repoUrl/i, 'the error names the repoUrl parameter: ' + error.message);
+          assert.doesNotMatch(
+            error.message,
+            /git clone failed|fetch --tags/i,
+            'it is a validation error, not a clone failure: ' + error.message,
+          );
+          return true;
+        },
+      );
+    });
+
+    assert.equal(existsSync(logPath), false, 'no git process was started');
+    assert.equal(existsSync(vendor), false, 'no vendor directory was created');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// V7-F2 (round 2): every git step is timeout-bounded and the timeout is reported.
+
+test('V7-F2: DSH_SUPERPOWERS_GIT_TIMEOUT_MS bounds a hung git step and leaves no checkout', { skip: process.platform === 'win32' }, () => {
+  // Neutral temp prefix: the word "timeout" must come from the implementation's
+  // diagnostic, never from the scratch path the message happens to contain.
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-git-bound-'));
+  try {
+    // A valid file: remote, so only the shim's hang can fail the first step.
+    const remote = join(root, 'remote');
+    mkdirSync(remote);
+    assert.equal(runGit(['init', '--bare', remote]).status, 0, 'bare remote created');
+    const url = pathToFileURL(remote).href;
+
+    const shimDir = join(root, 'shim');
+    mkdirSync(shimDir);
+    const shimPath = join(shimDir, 'git');
+    writeFileSync(shimPath, '#!/bin/sh' + LF + 'exec sleep 2' + LF);
+    chmodSync(shimPath, 0o755);
+
+    const vendor = join(root, 'fresh', 'vendor');
+    let elapsed = 0;
+    withPatchedEnv(
+      { PATH: shimDir + ':' + process.env.PATH, DSH_SUPERPOWERS_GIT_TIMEOUT_MS: '100' },
+      () => {
+        const started = Date.now();
+        assert.throws(
+          () => updateSkills(vendor, url),
+          (error) => {
+            assert.ok(error instanceof Error, 'a timed-out step throws an Error');
+            assert.match(
+              error.message,
+              /timed out|timeout|timed-out/i,
+              'the failure names the timeout: ' + error.message,
+            );
+            return true;
+          },
+        );
+        elapsed = Date.now() - started;
+      },
+    );
+
+    assert.ok(elapsed < 5000, 'the hung git step is bounded; elapsed ' + elapsed + 'ms');
+    assert.equal(existsSync(join(vendor, '.git')), false, 'no checkout is left behind');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

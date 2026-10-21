@@ -41,6 +41,47 @@ export function redactCredentials(text) {
   return text.replace(URL_USERINFO, '$1***@');
 }
 
+/**
+ * Characters that could forge or visually reorder a diagnostic line: C0
+ * controls, DEL, C1 controls, line/paragraph separators, and bidi formatting
+ * controls. A directory name or git error is vendor-influenced input.
+ */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069]/g;
+const CONTROL_ESCAPES = { '\n': '\\n', '\r': '\\r', '\t': '\\t' };
+
+/**
+ * Escape control characters before text reaches a log or console line.
+ * @param {unknown} value - text about to be printed.
+ * @returns {string} the text with control characters escaped.
+ */
+function escapeControlChars(value) {
+  return String(value).replace(CONTROL_CHARS, (char) =>
+    CONTROL_ESCAPES[char] ?? '\\u{' + char.charCodeAt(0).toString(16).padStart(4, '0') + '}');
+}
+
+/** Environment override for the per-git-step bound. */
+const GIT_TIMEOUT_ENV = 'DSH_SUPERPOWERS_GIT_TIMEOUT_MS';
+/** Default bound for one git invocation: five minutes. */
+const DEFAULT_GIT_TIMEOUT_MS = 300000;
+
+/**
+ * Resolve the per-git-step timeout. A positive safe integer in
+ * DSH_SUPERPOWERS_GIT_TIMEOUT_MS overrides the default; any other value is
+ * ignored, so a malformed variable cannot disable the bound.
+ * @returns {number} timeout in milliseconds.
+ */
+function gitTimeoutMs() {
+  const raw = process.env[GIT_TIMEOUT_ENV];
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (/^[0-9]+$/.test(trimmed)) {
+      const value = Number(trimmed);
+      if (Number.isSafeInteger(value) && value > 0) return value;
+    }
+  }
+  return DEFAULT_GIT_TIMEOUT_MS;
+}
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const PLUGIN_DIR = resolve(HERE, '..');
 export const DEFAULT_VENDOR_DIR = join(PLUGIN_DIR, 'vendor', 'superpowers');
@@ -151,6 +192,7 @@ function runGit(args, cwd, env) {
     cwd,
     env: env ?? process.env,
     stdio: 'inherit',
+    timeout: gitTimeoutMs(),
   });
 }
 
@@ -160,6 +202,7 @@ function runGitCapture(args, cwd, env) {
     env: env ?? process.env,
     stdio: ['ignore', 'pipe', 'pipe'],
     encoding: 'utf8',
+    timeout: gitTimeoutMs(),
   });
 }
 
@@ -168,70 +211,88 @@ function fail(message) {
 }
 
 /**
- * One-line cause for a failed captured git call, without inventing a reason.
- * Credentials embedded in a remote URL are masked before the line is logged.
+ * One-line cause for a failed git call, without inventing a reason. A
+ * timeout is named explicitly; credentials embedded in a remote URL are
+ * masked and control characters are escaped before the line is logged.
+ * @param {object} result - result of a runGit/runGitCapture call.
+ * @returns {string} one escaped, redacted diagnostic line.
  */
 function gitFailureCause(result) {
-  if (result.error) return redactCredentials(result.error.message);
+  if (result?.error?.code === 'ETIMEDOUT') return `timed out after ${gitTimeoutMs()} ms`;
+  if (result.error) return escapeControlChars(redactCredentials(result.error.message));
   const detail = (result.stderr ?? '')
     .split(String.fromCharCode(10))
     .map((line) => line.trim())
     .find((line) => line !== '');
-  return detail === undefined ? `git exited ${result.status ?? 'null'}` : redactCredentials(detail);
+  if (detail === undefined) return `git exited ${result.status ?? 'null'}`;
+  return escapeControlChars(redactCredentials(detail));
 }
 
 /**
  * Clone on first run, fetch tags, and check out the newest tag.
+ *
+ * A repoUrl whose trimmed value starts with "-" is rejected, and the clone
+ * argv places "--" before the URL, so a URL can never be parsed as a git
+ * option. Every git step is bounded by gitTimeoutMs().
+ *
  * @param {string} vendorDir - vendor checkout directory.
  * @param {string} [repoUrl] - source repository URL, used for the first-run
  *   clone only (later runs fetch tags from the checkout's origin). Defaults to
- *   REPO_URL; an empty or non-string override is rejected rather than cloned.
- * @returns {number} 0 on success; throws on any failed git step.
+ *   REPO_URL; an empty, non-string or option-like override is rejected rather
+ *   than cloned.
+ * @returns {number} 0 on success; throws on any failed or timed-out git step.
  */
 export function updateSkills(vendorDir, repoUrl = REPO_URL) {
   if (typeof repoUrl !== 'string' || repoUrl.trim() === '') {
     fail('repoUrl must be a non-empty string')
   }
+  const cloneUrl = repoUrl.trim()
+  if (cloneUrl.startsWith('-')) {
+    fail(`repoUrl must not start with "-" after trimming (got ${escapeControlChars(JSON.stringify(cloneUrl))}); pass a repository URL, not an option`)
+  }
+  const safeVendorDir = escapeControlChars(vendorDir);
+  const safeCloneUrl = escapeControlChars(redactCredentials(cloneUrl));
   if (existsSync(vendorDir) && !isGitCheckout(vendorDir)) {
-    fail(`vendor directory exists but is not a git checkout: ${vendorDir}\n` +
-      'Remove it or pass a different --dir, then retry.');
+    fail(`vendor directory exists but is not a git checkout: ${safeVendorDir}\n` +
+      'Remove it or pass a different --dir, then retry.')
   }
 
   if (!isGitCheckout(vendorDir)) {
     mkdirSync(dirname(vendorDir), { recursive: true });
-    console.error(`[dsh-superpowers] cloning ${redactCredentials(repoUrl)} -> ${vendorDir}`);
-    const clone = runGit(['clone', '--depth', '1', repoUrl, vendorDir], dirname(vendorDir));
+    console.error(`[dsh-superpowers] cloning ${safeCloneUrl} -> ${safeVendorDir}`);
+    const clone = runGit(['clone', '--depth', '1', '--', cloneUrl, vendorDir], dirname(vendorDir));
     if (clone.status !== 0) {
-      fail(`git clone failed (exit ${clone.status ?? 'null'}) for ${redactCredentials(repoUrl)}`);
+      fail(`git clone failed (${gitFailureCause(clone)}) for ${safeCloneUrl}`);
     }
   }
 
   console.error('[dsh-superpowers] fetching tags');
   const fetch = runGit(['fetch', '--tags', '--force', 'origin'], vendorDir);
   if (fetch.status !== 0) {
-    fail(`git fetch --tags failed (exit ${fetch.status ?? 'null'}) in ${vendorDir}`);
+    fail(`git fetch --tags failed (${gitFailureCause(fetch)}) in ${safeVendorDir}`);
   }
 
   const tagList = runGitCapture(['tag', '--sort=-v:refname'], vendorDir);
   const tag = (tagList.stdout ?? '').split(String.fromCharCode(10)).map((line) => line.trim()).find((line) => line !== '') ?? '';
   if (tagList.status !== 0 || tag === '') {
-    fail(`could not resolve the newest tag from ${vendorDir}`);
+    fail(`could not resolve the newest tag from ${safeVendorDir} (${gitFailureCause(tagList)})`);
   }
+  const safeTag = escapeControlChars(tag);
 
   const rev = runGitCapture(['rev-list', '-n', '1', tag], vendorDir);
   const hash = (rev.stdout ?? '').trim();
   if (rev.status !== 0 || hash === '') {
-    fail('could not resolve the commit for tag ' + tag);
+    fail('could not resolve the commit for tag ' + safeTag + ' (' + gitFailureCause(rev) + ')');
   }
 
-  console.error(`[dsh-superpowers] checking out ${tag}`);
+  console.error(`[dsh-superpowers] checking out ${safeTag}`);
   const checkout = runGit(['checkout', '--force', tag], vendorDir);
   if (checkout.status !== 0) {
-    fail(`git checkout ${tag} failed (exit ${checkout.status ?? 'null'}) in ${vendorDir}`);
+    fail(`git checkout ${safeTag} failed (${gitFailureCause(checkout)}) in ${safeVendorDir}`);
   }
 
-  console.log(`Resolved superpowers tag: ${tag}`);
-  console.log(`Commit: ${hash}`);
+  console.log(`Resolved superpowers tag: ${safeTag}`);
+  console.log(`Commit: ${escapeControlChars(hash)}`);
   return 0;
 }
 
@@ -241,6 +302,7 @@ export function updateSkills(vendorDir, repoUrl = REPO_URL) {
  * "dsh-superpowers: ..." diagnostics.
  */
 export function status(vendorDir) {
+  const safeVendorDir = escapeControlChars(vendorDir);
   const pathExists = existsSync(vendorDir);
   const isGit = isGitCheckout(vendorDir);
   let tag = null;
@@ -250,27 +312,28 @@ export function status(vendorDir) {
       tag = (described.stdout ?? '').trim() || null;
     } else {
       // Keep the n/a line, but say why: a failed describe is not "no tags".
-      console.error(`dsh-superpowers: could not read the tag in ${vendorDir} (${gitFailureCause(described)})`);
+      console.error(`dsh-superpowers: could not read the tag in ${safeVendorDir} (${gitFailureCause(described)})`);
     }
   }
   const skillsDir = skillsDirFor(vendorDir);
+  const safeSkillsDir = escapeControlChars(skillsDir);
   let skills = [];
   if (existsSync(skillsDir)) {
     const { entries, error } = readSkillEntries(skillsDir);
     if (error) {
-      console.error(`dsh-superpowers: skills directory unreadable at ${skillsDir} (${error.message})`);
+      console.error(`dsh-superpowers: skills directory unreadable at ${safeSkillsDir} (${escapeControlChars(error.message)})`);
     } else {
       skills = skillDirsFromEntries(skillsDir, entries);
     }
   }
 
-  console.log(`vendor dir: ${vendorDir}`);
+  console.log(`vendor dir: ${safeVendorDir}`);
   console.log(`exists: ${pathExists ? 'yes' : 'no'}`);
   console.log(`git: ${isGit ? 'yes' : 'no'}`);
-  console.log(`tag: ${tag ?? 'n/a'}`);
+  console.log(`tag: ${tag === null ? 'n/a' : escapeControlChars(tag)}`);
   console.log(`skill dirs: ${skills.length}`);
   if (skills.length > 0) {
-    console.log(`skills: ${skills.join(', ')}`);
+    console.log(`skills: ${escapeControlChars(skills.join(', '))}`);
   } else if (!isGit) {
     console.log('run "dsh-superpowers update-skills" to create the vendor checkout');
   }
@@ -283,7 +346,7 @@ export function main(argv = process.argv.slice(2)) {
   try {
     parsed = parseArgs(argv);
   } catch (error) {
-    console.error(`dsh-superpowers: ${error.message}`);
+    console.error(`dsh-superpowers: ${escapeControlChars(error.message)}`);
     console.error(USAGE);
     return 2;
   }
@@ -298,7 +361,7 @@ export function main(argv = process.argv.slice(2)) {
       ? updateSkills(parsed.vendorDir)
       : status(parsed.vendorDir);
   } catch (error) {
-    console.error(`dsh-superpowers: ${error.message}`);
+    console.error(`dsh-superpowers: ${escapeControlChars(error.message)}`);
     return 1;
   }
 }

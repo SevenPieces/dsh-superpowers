@@ -17,7 +17,9 @@ dsh plugin --profile web add ~/.dsh/plugins/dsh-superpowers
 dsh plugin --profile web exec dsh-superpowers update-skills
 
 Or directly: node bin/dsh-superpowers.mjs update-skills
-Status: node bin/dsh-superpowers.mjs status (prints the vendor path, whether it exists, whether it is a git checkout, the tag, and the skill dirs count; it writes a stderr diagnostic when the tag or the skills directory cannot be read, with credentials in a remote URL masked)
+Status: node bin/dsh-superpowers.mjs status (prints the vendor path, whether it exists, whether it is a git checkout, the tag, and the skill dirs count; it writes a stderr diagnostic when the tag or the skills directory cannot be read, masking URL userinfo (user:password@) in a remote URL)
+
+Only URL userinfo is masked: a token carried in a query string or fragment of a remote URL (for example ?token=...) is not detected or removed.
 
 The command checks out the newest tag by version sort and does not pin a commit or verify a signature: whatever the upstream repository publishes at that tag becomes the skills and bootstrap text this plugin loads. Treat update-skills as a trust decision and review the checkout (`git -C vendor/superpowers log -1`, `git -C vendor/superpowers diff <old-tag> <new-tag>`) if provenance matters to you.
 
@@ -26,6 +28,8 @@ The profile-mutating form (`dsh plugin ... exec`) needs write access to the inst
 ```
 node bin/dsh-superpowers.mjs update-skills --dir <writable vendor checkout>
 ```
+
+Each git step this CLI runs - clone, fetch, tag lookup, checkout, and status's describe - is bounded by a timeout: five minutes by default, overridable with a positive-integer `DSH_SUPERPOWERS_GIT_TIMEOUT_MS`.
 
 A skills-content upgrade takes effect on the next model request, without reloading the plugin: the bootstrap section provider re-reads the vendor tree at each assembly, and each skill body is re-read on every lookup. The harness does cache the discovered catalog (skill names and descriptions) until that cache is invalidated, so adding, removing or renaming a skill directory may not show up in an already-running session until then.
 
