@@ -923,3 +923,65 @@ test('R5-F1: a 512 KiB single-line git error fails fast with the clean clone dia
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// R7-F1 (round 8): the replayed git stream must be redacted too, not only the
+// plugin's own failure diagnostic.
+
+/** A POSIX fake 'git' that echoes a credential-bearing error line, then fails. */
+function makeCredentialLeakGitShim(root) {
+  const shimDir = join(root, 'shim');
+  mkdirSync(shimDir);
+  const shimPath = join(shimDir, 'git');
+  writeFileSync(
+    shimPath,
+    '#!/bin/sh' + LF +
+      "echo 'fatal: unable to access https://user:supersecret@host.example/x: The requested URL returned error: 400' >&2" + LF +
+      'exit 1' + LF,
+  );
+  chmodSync(shimPath, 0o755);
+  return { shimDir };
+}
+
+test('R7-F1: a credential-bearing git error line is redacted in the replayed stream', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-credleak-'));
+  try {
+    const { shimDir } = makeCredentialLeakGitShim(root);
+    const vendor = join(root, 'fresh', 'vendor');
+    const repoUrl = 'file://' + join(root, 'unused.git');
+
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', updateSkillsChildScript()], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: shimDir + ':' + process.env.PATH,
+        VENDOR_DIR: vendor,
+        REMOTE_URL: repoUrl,
+      },
+      timeout: 15000,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    const combined = (child.stdout ?? '') + (child.stderr ?? '');
+
+    assert.equal(child.status, 7, 'the child caught the error and exited on its own: ' + JSON.stringify(combined.slice(0, 300)));
+    assert.match(
+      child.stdout ?? '',
+      /MARKER:CAUGHT:git clone failed \(/,
+      'the caught error is the clean clone diagnostic: ' + JSON.stringify((child.stdout ?? '').slice(0, 200)),
+    );
+    // The masked form must survive in the output (replayed stream and/or diagnostic).
+    assert.ok(
+      combined.includes('https://***@host.example/x'),
+      'the credential URL is masked in the output: ' + JSON.stringify(combined.slice(0, 400)),
+    );
+    // The secret must not leak through the replay path.
+    assert.ok(
+      !combined.includes('supersecret'),
+      'the password never reaches the output: ' + JSON.stringify(combined.slice(0, 400)),
+    );
+    assert.ok(!combined.includes('user:supersecret'), 'the userinfo pair never reaches the output');
+    assertNoStreamError(combined, 'credential replay');
+    assert.ok(!existsSync(join(vendor, '.git')), 'no checkout is left behind');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

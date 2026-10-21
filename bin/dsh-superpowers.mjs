@@ -291,9 +291,13 @@ function isGitCheckout(dir) {
  * Reprint captured git output on a local stream, escaping control and bidi
  * characters while preserving line structure. LF/CRLF separators are written
  * unchanged (so normal multi-line output stays multi-line); a bare CR is
- * escaped like any other control character. Escaped text is accumulated and
- * flushed in GIT_REPLAY_CHUNK_BYTES-sized chunks, so a newline-dense stream
- * costs a bounded number of writes instead of one per line.
+ * escaped like any other control character. Each non-newline part is first run
+ * through redactCredentials, so a captured git line that echoes a
+ * scheme://userinfo@host URL is masked in the replay just as it is in the
+ * plugin's own diagnostics. Parts are complete lines, so a URL is never split.
+ * Escaped text is accumulated and flushed in GIT_REPLAY_CHUNK_BYTES-sized
+ * chunks, so a newline-dense stream costs a bounded number of writes instead
+ * of one per line.
  * @param {NodeJS.WriteStream} stream - destination stream.
  * @param {string | null | undefined} text - captured git output.
  */
@@ -314,7 +318,7 @@ function replaySanitized(stream, text) {
   for (const part of text.split(/(\r?\n)/)) {
     if (part === '') continue;
     if (part === '\n' || part === '\r\n') append(part);
-    else append(escapeControlChars(part));
+    else append(escapeControlChars(redactCredentials(part)));
   }
   if (chunk !== '') stream.write(chunk);
 }
