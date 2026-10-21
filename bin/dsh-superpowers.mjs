@@ -67,6 +67,13 @@ const GIT_TIMEOUT_ENV = 'DSH_SUPERPOWERS_GIT_TIMEOUT_MS';
 const DEFAULT_GIT_TIMEOUT_MS = 300000;
 
 /**
+ * Ceiling on each captured git stream. Large legitimate tag sets exceed the
+ * spawnSync default of 1 MiB; 16 MiB lifts that without leaving capture
+ * unbounded, so pathological output still fails closed with ENOBUFS.
+ */
+const GIT_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+
+/**
  * Resolve the per-git-step timeout. A positive safe integer in
  * DSH_SUPERPOWERS_GIT_TIMEOUT_MS overrides the default; any other value is
  * ignored, so a malformed variable cannot disable the bound.
@@ -205,6 +212,26 @@ function replaySanitized(stream, text) {
   }
 }
 
+/**
+ * Remove only trailing line terminators from captured git output. A ref name
+ * may legally end in a Unicode space (U+00A0, U+3000, U+FEFF), which JS
+ * trim() would strip and thereby corrupt the ref.
+ * @param {string | null | undefined} text - captured git output.
+ * @returns {string} the text without trailing CR/LF characters.
+ */
+function stripTrailingNewlines(text) {
+  return String(text ?? '').replace(/[\r\n]+$/, '');
+}
+
+/**
+ * Run git with captured streams and replay the output through
+ * escapeControlChars. Capture is bounded by GIT_MAX_BUFFER_BYTES: a large
+ * legitimate tag set is accepted, pathological output fails closed.
+ * @param {string[]} args - git arguments.
+ * @param {string} cwd - working directory for the step.
+ * @param {object} [env] - environment (defaults to process.env).
+ * @returns {object} the spawnSync result, with utf8 stdout/stderr.
+ */
 function runGit(args, cwd, env) {
   // Capture instead of inheriting: git output can echo a vendor-controlled ref
   // name, which must never reach the terminal raw.
@@ -214,12 +241,22 @@ function runGit(args, cwd, env) {
     stdio: ['ignore', 'pipe', 'pipe'],
     encoding: 'utf8',
     timeout: gitTimeoutMs(),
+    maxBuffer: GIT_MAX_BUFFER_BYTES,
   });
   replaySanitized(process.stdout, result.stdout);
   replaySanitized(process.stderr, result.stderr);
   return result;
 }
 
+/**
+ * Run git with captured streams and no replay, bounded by
+ * GIT_MAX_BUFFER_BYTES (16 MiB) so a large tag listing is captured while
+ * pathological output still fails closed with ENOBUFS.
+ * @param {string[]} args - git arguments.
+ * @param {string} cwd - working directory for the step.
+ * @param {object} [env] - environment (defaults to process.env).
+ * @returns {object} the spawnSync result, with utf8 stdout/stderr.
+ */
 function runGitCapture(args, cwd, env) {
   return spawnSync('git', args, {
     cwd,
@@ -227,6 +264,7 @@ function runGitCapture(args, cwd, env) {
     stdio: ['ignore', 'pipe', 'pipe'],
     encoding: 'utf8',
     timeout: gitTimeoutMs(),
+    maxBuffer: GIT_MAX_BUFFER_BYTES,
   });
 }
 
@@ -297,7 +335,9 @@ export function updateSkills(vendorDir, repoUrl = REPO_URL) {
   }
 
   const tagList = runGitCapture(['tag', '--sort=-v:refname'], vendorDir);
-  const tag = (tagList.stdout ?? '').split(String.fromCharCode(10)).map((line) => line.trim()).find((line) => line !== '') ?? '';
+  // Split on CRLF/LF and take the first non-empty line verbatim: trimming a
+  // legal ref name that ends in a Unicode space would corrupt it.
+  const tag = (tagList.stdout ?? '').split(/\r?\n/).find((line) => line !== '') ?? '';
   if (tagList.status !== 0 || tag === '') {
     fail(`could not resolve the newest tag from ${safeVendorDir} (${gitFailureCause(tagList)})`);
   }
@@ -305,7 +345,7 @@ export function updateSkills(vendorDir, repoUrl = REPO_URL) {
 
   const tagRef = 'refs/tags/' + tag;
   const rev = runGitCapture(['rev-list', '-n', '1', tagRef], vendorDir);
-  const hash = (rev.stdout ?? '').trim();
+  const hash = stripTrailingNewlines(rev.stdout);
   if (rev.status !== 0 || hash === '') {
     fail('could not resolve the commit for tag ' + safeTag + ' (' + gitFailureCause(rev) + ')');
   }
@@ -334,7 +374,7 @@ export function status(vendorDir) {
   if (isGit) {
     const described = runGitCapture(['describe', '--tags', '--always'], vendorDir);
     if (described.status === 0) {
-      tag = (described.stdout ?? '').trim() || null;
+      tag = stripTrailingNewlines(described.stdout) || null;
     } else {
       // Keep the n/a line, but say why: a failed describe is not "no tags".
       console.error(`dsh-superpowers: could not read the tag in ${safeVendorDir} (${gitFailureCause(described)})`);

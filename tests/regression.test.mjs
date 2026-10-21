@@ -581,3 +581,174 @@ test('NEW-4: updateSkills checks out a legal tag named "-x" via refs/tags withou
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// R3-F1 (round 4): a legal tag ending in a Unicode space-like character must not
+// be JS-trimmed away - the exact ref must resolve, and status must show it.
+
+/** Strip only trailing CR/LF, never Unicode whitespace (legal tags can end in it). */
+function stripTrailingNewlines(text) {
+  return String(text ?? '').replace(/[\r\n]+$/, '');
+}
+
+const TRAILING_SPACE_TAGS = [
+  ['U+FEFF', String.fromCharCode(0xfeff), 'feff'],
+  ['U+00A0', String.fromCharCode(0x00a0), '00a0'],
+];
+
+test('R3-F1: updateSkills resolves and checks out tags ending in U+FEFF and U+00A0', () => {
+  for (const [label, suffix] of TRAILING_SPACE_TAGS) {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-sp-tagspace-'));
+    try {
+      const tag = 'v1.0.0' + suffix;
+      const { url } = makeBareRemoteWithTag(root, tag);
+      const vendor = join(root, 'fresh', 'vendor');
+
+      assert.equal(updateSkills(vendor, url), 0, label + ': the exact tag resolves');
+      const describe = stripTrailingNewlines(runGit(['describe', '--tags'], vendor).stdout);
+      assert.equal(describe, tag, label + ': the exact tag is checked out, trailing character intact');
+      assert.ok(describe.endsWith(suffix), label + ': the trailing character survives checkout');
+      assert.equal(
+        runGit(['rev-parse', 'HEAD'], vendor).stdout.trim(),
+        runGit(['rev-parse', 'refs/tags/' + tag], vendor).stdout.trim(),
+        label + ': HEAD is exactly the tagged commit',
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('R3-F1: status reports tags ending in U+FEFF and U+00A0 untrimmed', () => {
+  for (const [label, suffix, hex] of TRAILING_SPACE_TAGS) {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-sp-status-tagspace-'));
+    try {
+      const tag = 'v1.0.0' + suffix;
+      const repo = join(root, 'repo');
+      mkdirSync(repo);
+      assert.equal(runGit(['init'], repo).status, 0, label + ': repo initialised');
+      runGit(['config', 'user.email', 't@example.com'], repo);
+      runGit(['config', 'user.name', 't'], repo);
+      writeFileSync(join(repo, 'f.txt'), 'a');
+      runGit(['add', 'f.txt'], repo);
+      assert.equal(runGit(['commit', '-m', 'a'], repo).status, 0, label + ': commit created');
+      assert.equal(
+        runGit(['update-ref', 'refs/tags/' + tag, 'HEAD'], repo).status,
+        0,
+        label + ': tag created',
+      );
+      assert.equal(
+        runGit(['checkout', '--force', 'refs/tags/' + tag], repo).status,
+        0,
+        label + ': checkout created',
+      );
+
+      const statusResult = spawnSync(
+        process.execPath,
+        [join(PLUGIN_DIR, 'bin', 'dsh-superpowers.mjs'), 'status', '--dir', repo],
+        { encoding: 'utf8' },
+      );
+      assert.equal(statusResult.status, 0, label + ': status exits 0: ' + statusResult.stderr);
+      const tagLine = statusResult.stdout.split(LF).find((line) => line.startsWith('tag: '));
+      assert.ok(tagLine, label + ': status prints a tag line: ' + statusResult.stdout);
+      const displayed = tagLine.slice(5);
+      // The trailing character must survive: raw for U+00A0, or escaped for
+      // U+FEFF (a zero-width control escaped for terminal safety).
+      assert.ok(
+        displayed === tag || displayed === 'v1.0.0' + BACKSLASH + 'u{' + hex + '}',
+        label + ': status reports the untrimmed tag, got ' + JSON.stringify(tagLine),
+      );
+      assert.ok(!displayed.endsWith('v1.0.0'), label + ': the trailing character is not trimmed away');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+// R3-F2 (round 4): a legitimate large tag set must not fail at spawnSync's 1 MiB
+// default; the implementation's explicit capture bound must admit it.
+
+test('R3-F2: updateSkills succeeds when fetch output exceeds 1 MiB (large legal tag set)', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-bigtags-'));
+  try {
+    const remote = join(root, 'remote');
+    mkdirSync(remote);
+    assert.equal(runGit(['init', '--bare', remote]).status, 0, 'bare remote created');
+    const work = join(root, 'work');
+    assert.equal(runGit(['clone', remote, work]).status, 0, 'work clone created');
+    runGit(['config', 'user.email', 't@example.com'], work);
+    runGit(['config', 'user.name', 't'], work);
+    writeFileSync(join(work, 'f.txt'), 'a');
+    runGit(['add', 'f.txt'], work);
+    assert.equal(runGit(['commit', '-m', 'a'], work).status, 0, 'first commit created');
+    const taggedSha = runGit(['rev-parse', 'HEAD'], work).stdout.trim();
+    writeFileSync(join(work, 'f.txt'), 'b');
+    runGit(['add', 'f.txt'], work);
+    assert.equal(runGit(['commit', '-m', 'b'], work).status, 0, 'second commit created');
+    assert.equal(runGit(['push', 'origin', 'HEAD'], work).status, 0, 'branch pushed');
+
+    // Tags point at the parent commit, which a --depth 1 clone does not fetch,
+    // so the follow-up fetch must emit a line per tag.
+    const tagCount = 3000;
+    const body = 'x'.repeat(220);
+    const refs = [];
+    for (let index = 0; index < tagCount; index += 1) {
+      refs.push('create refs/tags/v2.' + String(index).padStart(4, '0') + '.0-' + body + ' ' + taggedSha);
+    }
+    const created = spawnSync(
+      'git',
+      ['-c', 'commit.gpgsign=false', '-c', 'tag.gpgsign=false', 'update-ref', '--stdin'],
+      { cwd: work, input: refs.join(LF) + LF, encoding: 'utf8' },
+    );
+    assert.equal(created.status, 0, 'tags batch-created: ' + created.stderr);
+    assert.equal(
+      runGit(['push', '--quiet', 'origin', 'refs/tags/*:refs/tags/*'], work).status,
+      0,
+      'all tags pushed in one command',
+    );
+
+    const url = pathToFileURL(remote).href;
+
+    // Preflight: prove the fixture really exceeds the 1 MiB spawnSync default.
+    const probe = join(root, 'probe');
+    assert.equal(runGit(['clone', '--depth', '1', url, probe], root).status, 0, 'probe clone created');
+    const probeFetch = spawnSync(
+      'git',
+      ['-c', 'commit.gpgsign=false', '-c', 'tag.gpgsign=false', 'fetch', '--tags', '--force', 'origin'],
+      { cwd: probe, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+    );
+    assert.equal(probeFetch.status, 0, 'probe fetch succeeds: ' + probeFetch.stderr);
+    const fetchOutputBytes = Buffer.byteLength(probeFetch.stderr ?? '', 'utf8');
+    assert.ok(
+      fetchOutputBytes > 1024 * 1024,
+      'the fixture must exceed the 1 MiB default; measured ' + fetchOutputBytes + ' bytes',
+    );
+
+    const vendor = join(root, 'fresh', 'vendor');
+    const binUrl = pathToFileURL(join(PLUGIN_DIR, 'bin', 'dsh-superpowers.mjs')).href;
+    const script = [
+      'import { updateSkills } from ' + JSON.stringify(binUrl) + ';',
+      'process.exitCode = updateSkills(process.env.VENDOR_DIR, process.env.REMOTE_URL);',
+    ].join(LF);
+
+    const started = Date.now();
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf8',
+      env: { ...process.env, VENDOR_DIR: vendor, REMOTE_URL: url },
+      // The child replays the captured git output; keep the harness bound wide
+      // enough that the test observes the implementation, not its own default.
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    const elapsed = Date.now() - started;
+
+    assert.equal(
+      child.status,
+      0,
+      'updateSkills succeeds past the 1 MiB default capture: ' + (child.stderr ?? '').slice(0, 800),
+    );
+    assert.ok(existsSync(join(vendor, '.git')), 'a checkout exists');
+    assert.notEqual(runGit(['describe', '--tags'], vendor).stdout.trim(), '', 'a tag is checked out');
+    assert.ok(elapsed < 60000, 'runtime stays reasonable; elapsed ' + elapsed + 'ms');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
