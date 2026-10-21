@@ -1,13 +1,49 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, symlinkSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { inject, discoverSkills, apply, PLUGIN_DIR, resolveConfig } from '../lib/index.js';
 import { updateSkills } from '../bin/dsh-superpowers.mjs';
 
 const LF = String.fromCharCode(10);
+
+/** Real git with commit/tag signing pinned off (F1 pattern). */
+function runGit(args, cwd) {
+  return spawnSync(
+    'git',
+    ['-c', 'commit.gpgsign=false', '-c', 'tag.gpgsign=false', ...args],
+    { cwd, encoding: 'utf8' },
+  );
+}
+
+/**
+ * Build a local bare remote whose newest version-sorted tag is v2.0.0
+ * (commit order and tag order are deliberately different).
+ * @returns {{ remote: string, url: string }} the bare repo path and its file: URL.
+ */
+function makeTaggedBareRemote(root) {
+  const remote = join(root, 'remote');
+  mkdirSync(remote);
+  assert.equal(runGit(['init', '--bare', remote]).status, 0, 'bare remote created');
+  const work = join(root, 'work');
+  assert.equal(runGit(['clone', remote, work]).status, 0, 'work clone created');
+  runGit(['config', 'user.email', 't@example.com'], work);
+  runGit(['config', 'user.name', 't'], work);
+  const commit = (content) => {
+    writeFileSync(join(work, 'f.txt'), content);
+    runGit(['add', 'f.txt'], work);
+    assert.equal(runGit(['commit', '-m', content], work).status, 0, 'commit ' + content + ' created');
+  };
+  commit('a');
+  assert.equal(runGit(['tag', 'v1.0.0'], work).status, 0, 'v1.0.0 tagged');
+  commit('b');
+  assert.equal(runGit(['tag', 'v2.0.0'], work).status, 0, 'v2.0.0 tagged');
+  assert.equal(runGit(['push', '--tags', 'origin', 'HEAD'], work).status, 0, 'tags pushed');
+  return { remote, url: pathToFileURL(remote).href };
+}
 
 function makeCtx() {
   const sections = new Map();
@@ -108,6 +144,22 @@ test('F1: updateSkills picks the highest semver tag, not the newest commit date'
 });
 
 test('bin runs through the installed-style symlink (D2 regression)', () => {
+  // Derived, not pinned: the vendor tag and skill set are mutable external data.
+  const vendorDir = join(PLUGIN_DIR, 'vendor', 'superpowers');
+  const described = spawnSync('git', ['-C', vendorDir, 'describe', '--tags'], { encoding: 'utf8' });
+  assert.equal(described.status, 0, 'git describe in the vendor checkout: ' + described.stderr);
+  const expectedTag = described.stdout.trim();
+  assert.match(expectedTag, /^v\d+\.\d+\.\d+/, 'the vendor checkout carries a version tag: ' + expectedTag);
+  // Count on disk, independently of the CLI under test, so a broken
+  // listSkillDirs cannot agree with itself and hide a wrong status count.
+  const skillsDir = join(vendorDir, 'skills');
+  const expectedSkillDirs = readdirSync(skillsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.') &&
+      existsSync(join(skillsDir, entry.name, 'SKILL.md')))
+    .map((entry) => entry.name)
+    .sort().length;
+  assert.ok(expectedSkillDirs > 0, 'the vendor checkout ships skill dirs');
+
   const dir = mkdtempSync(join(tmpdir(), 'dsh-sp-bin-'));
   try {
     const real = join(PLUGIN_DIR, 'bin', 'dsh-superpowers.mjs');
@@ -115,11 +167,11 @@ test('bin runs through the installed-style symlink (D2 regression)', () => {
     symlinkSync(real, link);
     const viaLink = spawnSync(process.execPath, [link, 'status'], { encoding: 'utf8' });
     assert.equal(viaLink.status, 0, 'symlinked bin exits 0: ' + viaLink.stderr);
-    assert.ok(viaLink.stdout.includes('tag: v6.3.0'));
-    assert.ok(viaLink.stdout.includes('skill dirs: 14'));
+    assert.ok(viaLink.stdout.includes('tag: ' + expectedTag), 'the tag line reports git describe: ' + viaLink.stdout);
+    assert.ok(viaLink.stdout.includes('skill dirs: ' + expectedSkillDirs), 'the count matches the vendor tree: ' + viaLink.stdout);
     const direct = spawnSync(process.execPath, [real, 'status'], { encoding: 'utf8' });
     assert.equal(direct.status, 0);
-    assert.ok(direct.stdout.includes('skill dirs: 14'));
+    assert.ok(direct.stdout.includes('skill dirs: ' + expectedSkillDirs), 'direct run counts the same: ' + direct.stdout);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -188,6 +240,96 @@ test('F5 (behaviour kept by decision) updateSkills resolves the highest version-
       'v2.0.0-rc1',
       'the prerelease outranks v1.2.0 by version sort, and that is the kept behaviour',
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// F2 is the first-run clone branch: it must be exercised without network,
+// through an injected file: URL, and it must fail closed on bad input.
+
+test('F2: updateSkills(vendorDir, repoUrl) clones a fresh directory from the injected URL and checks out the newest version-sorted tag', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-clone-'));
+  // Hermetic: only the file: transport is allowed, so a clone that ignored the
+  // injected repoUrl could never reach the default GitHub URL.
+  const previousProtocol = process.env.GIT_ALLOW_PROTOCOL;
+  process.env.GIT_ALLOW_PROTOCOL = 'file';
+  try {
+    const { url } = makeTaggedBareRemote(root);
+    const vendor = join(root, 'fresh', 'nested', 'vendor');
+    assert.equal(existsSync(vendor), false, 'the target directory is missing before the first run');
+
+    assert.equal(updateSkills(vendor, url), 0);
+
+    assert.ok(existsSync(join(vendor, '.git')), 'the first run creates a git checkout');
+    assert.equal(runGit(['describe', '--tags'], vendor).stdout.trim(), 'v2.0.0', 'the newest version-sorted tag is checked out');
+    assert.equal(
+      runGit(['rev-parse', 'HEAD'], vendor).stdout.trim(),
+      runGit(['rev-parse', 'v2.0.0'], vendor).stdout.trim(),
+      'HEAD is exactly the tagged commit, not just the branch tip',
+    );
+    assert.equal(
+      runGit(['config', '--get', 'remote.origin.url'], vendor).stdout.trim(),
+      url,
+      'the checkout came from the injected repoUrl and not the default remote',
+    );
+  } finally {
+    if (previousProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL;
+    else process.env.GIT_ALLOW_PROTOCOL = previousProtocol;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('F2: updateSkills names the failed clone when the injected repoUrl cannot be cloned', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-clonefail-'));
+  const previousProtocol = process.env.GIT_ALLOW_PROTOCOL;
+  process.env.GIT_ALLOW_PROTOCOL = 'file';
+  try {
+    const badUrl = pathToFileURL(join(root, 'missing-remote', 'repo.git')).href;
+    const vendor = join(root, 'vendor');
+
+    assert.throws(
+      () => updateSkills(vendor, badUrl),
+      (error) => {
+        assert.ok(error instanceof Error, 'a clone failure throws an Error');
+        assert.match(error.message, /git clone failed/, 'the failure names the git clone step: ' + error.message);
+        assert.ok(
+          error.message.includes(badUrl),
+          'the failure names the URL it tried, proving the injected repoUrl was used: ' + error.message,
+        );
+        return true;
+      },
+      'a bad file: URL must fail the clone step',
+    );
+  } finally {
+    if (previousProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL;
+    else process.env.GIT_ALLOW_PROTOCOL = previousProtocol;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('F2: updateSkills refuses an existing non-git vendor directory before cloning', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-nongit-'));
+  try {
+    const vendor = join(root, 'vendor');
+    mkdirSync(vendor);
+    writeFileSync(join(vendor, 'keep.txt'), 'do not overwrite');
+
+    assert.throws(
+      () => updateSkills(vendor, pathToFileURL(join(root, 'remote')).href),
+      (error) => {
+        assert.match(
+          error.message,
+          /vendor directory exists but is not a git checkout/,
+          'the refusal is explicit: ' + error.message,
+        );
+        assert.ok(error.message.includes(vendor), 'the refusal names the directory: ' + error.message);
+        return true;
+      },
+      'an existing non-git directory must be refused, never cloned over',
+    );
+    assert.equal(existsSync(join(vendor, '.git')), false, 'no git checkout is created');
+    assert.equal(readFileSync(join(vendor, 'keep.txt'), 'utf8'), 'do not overwrite', 'the directory is left intact');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -8,7 +8,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs'
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -569,17 +569,38 @@ test('H10: absolute config overrides are unaffected', () => {
 
 // ---------------------------------------------------------------- I1
 
-test('I1: the real vendor tree still composes byte-identically with the frozen sha256', () => {
+const SKILLS_DIR_PLACEHOLDER = '<SKILLS_DIR>'
+
+/** Replace the install-specific skills path so a frozen pin is portable. */
+function normalizeComposition(text, skillsDir) {
+  return text.split(skillsDir).join(SKILLS_DIR_PLACEHOLDER)
+}
+
+test('I1: the real vendor tree still composes byte-identically, path-independently, with the frozen normalized sha256', () => {
   const config = resolveConfig({}, PLUGIN_DIR)
   const text = composeBootstrap(config.skillsDir, config.toolMappingPath)
 
   assert.equal(typeof text, 'string', 'the real vendor tree composes')
-  assert.equal(text.length, 4119, 'frozen composed length')
+  assert.ok(text.includes(config.skillsDir), 'the composition names the skills directory')
+
+  // The pin is install-path-independent: replace the absolute skills directory
+  // with a placeholder before checking length and hash, so the same test passes
+  // from a checkout, a copied tree, or an installed profile.
+  const normalized = normalizeComposition(text, config.skillsDir)
+  assert.ok(!normalized.includes(config.skillsDir), 'no install-specific path survives normalisation')
+  assert.equal(normalized.length, 4095, 'frozen normalized composed length')
   assert.equal(
-    createHash('sha256').update(text, 'utf8').digest('hex'),
-    '6808dd5eceb0ec44468d2770d39273c5ca3437800ed2c5bedab61001f4da4441',
-    'clean-tree sanitising must be a no-op',
+    createHash('sha256').update(normalized, 'utf8').digest('hex'),
+    '8d59f6d05512840684ebf62f832d9cacee47f5cb135dee0dd0fcae8555555ff7',
+    'frozen normalized hash; it changes only when vendor content changes',
   )
+
+  // Clean-tree sanitising is a no-op: the vendor body reaches the bootstrap verbatim.
+  const usingPath = join(config.skillsDir, 'using-superpowers', 'SKILL.md')
+  const body = parseFrontmatter(readFileSync(usingPath, 'utf8')).body.trim()
+  assert.ok(body.length > 0, 'the shipped using-superpowers body is non-empty')
+  assert.ok(text.includes(body), 'clean-tree sanitising must be a no-op on the vendor body')
+
   assert.equal(count(text, OPEN_TAG), 1, 'exactly one open wrapper tag in the clean tree')
   assert.equal(count(text, CLOSE_TAG), 1, 'exactly one close wrapper tag in the clean tree')
   assert.ok(!text.includes('{{'), 'no strict template group in the clean tree')
@@ -588,6 +609,45 @@ test('I1: the real vendor tree still composes byte-identically with the frozen s
   apply(ctx, {})
   assert.equal(sections.length, 1, 'bootstrap section registered')
   assert.deepEqual(Buffer.from(sections[0].text({}), 'utf8'), Buffer.from(text, 'utf8'), 'section text is byte-identical to composeBootstrap')
+})
+
+test('I1: composition is portability-safe — the same body and mapping from two different roots normalize identically', () => {
+  const rootA = makeTempDir()
+  const rootB = makeTempDir()
+  try {
+    const skillsA = join(rootA, 'a')
+    const skillsB = join(rootB, 'a-much-longer-skills-directory-name')
+    const body = 'PORTABLE-BODY'
+    const mappingText = 'PORTABLE-MAPPING'
+    writeSkill(join(skillsA, 'using-superpowers'), 'using-superpowers', 'x', body)
+    writeSkill(join(skillsB, 'using-superpowers'), 'using-superpowers', 'x', body)
+    const mappingA = join(rootA, 'dsh-tools.md')
+    const mappingB = join(rootB, 'dsh-tools.md')
+    writeFileSync(mappingA, mappingText)
+    writeFileSync(mappingB, mappingText)
+
+    const textA = composeBootstrap(skillsA, mappingA)
+    const textB = composeBootstrap(skillsB, mappingB)
+
+    assert.equal(typeof textA, 'string', 'composed from the first root')
+    assert.equal(typeof textB, 'string', 'composed from the second root')
+    assert.notEqual(skillsA, skillsB, 'the two roots differ')
+    assert.notEqual(textA, textB, 'raw composition is path-dependent')
+
+    const normalizedA = normalizeComposition(textA, skillsA)
+    const normalizedB = normalizeComposition(textB, skillsB)
+    assert.equal(normalizedA, normalizedB, 'normalization removes every path difference')
+    assert.equal(
+      createHash('sha256').update(normalizedA, 'utf8').digest('hex'),
+      createHash('sha256').update(normalizedB, 'utf8').digest('hex'),
+      'the normalized fingerprints agree across install paths',
+    )
+    assert.equal(count(normalizedA, OPEN_TAG), 1, 'one open wrapper tag from either root')
+    assert.equal(count(normalizedA, CLOSE_TAG), 1, 'one close wrapper tag from either root')
+  } finally {
+    cleanup(rootA)
+    cleanup(rootB)
+  }
 })
 
 // ------------------------------------------------ fix round 1 (H5 / H4)

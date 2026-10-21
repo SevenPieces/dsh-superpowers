@@ -5,15 +5,42 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { listSkillDirs } from '../bin/dsh-superpowers.mjs';
+import * as binModule from '../bin/dsh-superpowers.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const BIN = join(HERE, '..', 'bin', 'dsh-superpowers.mjs');
+const VENDOR_DIR = join(HERE, '..', 'vendor', 'superpowers');
+const VENDOR_SKILLS_DIR = join(VENDOR_DIR, 'skills');
+
+/** Escape a literal string so it can be embedded in a RegExp. */
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Facts about the mutable vendored checkout, read from git and the disk so the
+ * assertions cannot rot when the vendor tag or skill set changes.
+ */
+function vendorFacts() {
+  const described = spawnSync('git', ['-C', VENDOR_DIR, 'describe', '--tags'], { encoding: 'utf8' });
+  assert.equal(described.status, 0, 'git describe in the vendor checkout: ' + described.stderr);
+  const tag = described.stdout.trim();
+  // Count independently of the CLI under test: a broken listSkillDirs must not
+  // be able to agree with itself and hide a wrong status count.
+  const onDisk = readdirSync(VENDOR_SKILLS_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.') &&
+      existsSync(join(VENDOR_SKILLS_DIR, entry.name, 'SKILL.md')))
+    .map((entry) => entry.name)
+    .sort();
+  assert.deepEqual(listSkillDirs(VENDOR_SKILLS_DIR), onDisk, 'listSkillDirs agrees with the on-disk skill dirs');
+  return { tag, skillDirCount: onDisk.length };
+}
 
 /** Run the real CLI through node and capture stdout/stderr/status. */
 function runCli(args) {
@@ -115,12 +142,27 @@ test('H11b status prints a separate git: yes/no line for checkout vs plain direc
 });
 
 test('H11b status keeps the exists:, tag:, and skill dirs: lines on the real vendor dir (I5)', () => {
+  // Derived, not pinned: the vendor tag and skill set are mutable external data.
+  const facts = vendorFacts();
+  assert.match(facts.tag, /^v\d+\.\d+\.\d+/, 'the vendor checkout carries a version tag: ' + facts.tag);
+  assert.ok(facts.skillDirCount > 0, 'the vendor checkout ships skill dirs');
+
   const result = runCli(['status']);
 
-  assert.equal(result.status, 0, 'status exits 0: stderr=' + result.stderr);
+  assert.equal(result.status, 0, 'status exits 0: ' + result.stderr);
   assert.match(result.stdout, /^exists: yes$/m, 'real vendor dir exists: ' + result.stdout);
-  assert.match(result.stdout, /tag: v6\.3\.0/, 'tag line survives: ' + result.stdout);
-  assert.match(result.stdout, /skill dirs: 14/, 'skill dirs line survives: ' + result.stdout);
+  assert.match(
+    result.stdout,
+    new RegExp('^tag: ' + escapeRegExp(facts.tag) + '$', 'm'),
+    'the tag line must report the tag git describes, not a stale pin: ' + result.stdout,
+  );
+  const counted = /^skill dirs: (\d+)$/m.exec(result.stdout);
+  assert.ok(counted, 'the skill dirs line is printed: ' + result.stdout);
+  assert.equal(
+    Number(counted[1]),
+    facts.skillDirCount,
+    'the skill dir count must match the vendor tree on disk: ' + result.stdout,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -359,4 +401,26 @@ test('I-B a failing git step runs once with the inherited environment (no proxy 
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// F — bin exports redactCredentials and masks URL userinfo in diagnostics
+// ---------------------------------------------------------------------------
+
+test('F redactCredentials masks URL userinfo in a diagnostic line', () => {
+  // Namespace access keeps this file loadable while the export is still landing,
+  // so only this test is red rather than every test in the file.
+  const redactCredentials = binModule.redactCredentials;
+  assert.equal(typeof redactCredentials, 'function', 'the bin exports redactCredentials');
+
+  const line = 'fatal: unable to access https://user:secret@host.example/repo.git/: The requested URL returned error: 401';
+  const redacted = redactCredentials(line);
+
+  assert.equal(typeof redacted, 'string', 'redaction returns text');
+  assert.ok(!redacted.includes('secret'), 'the password is never echoed: ' + redacted);
+  assert.ok(redacted.includes('host.example'), 'the host stays diagnosable: ' + redacted);
+  assert.ok(redacted.includes('401'), 'the rest of the diagnostic survives: ' + redacted);
+
+  const plain = 'fatal: not a git repository (or any of the parent directories)';
+  assert.equal(redactCredentials(plain), plain, 'a line without credentials is unchanged');
 });

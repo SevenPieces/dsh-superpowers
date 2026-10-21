@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { resolveConfig, composeBootstrap, apply, createBootstrapProvider, PLUGIN_DIR, name, inject } from '../lib/index.js'
@@ -31,8 +31,20 @@ test('plugin exports, skill provider, and assembly-time bootstrap section over t
   assert.ok(text.includes('superpowers:using-superpowers bootstrap for dsh'))
   assert.ok(text.includes('subagent_fork'))
   assert.ok(!text.includes('{{'), 'bootstrap must not contain {{...}} (renderPrompt interpolation would fail)')
+  // The vendored tree is mutable external data: derive the expected catalog
+  // from the files on disk instead of pinning today's skill count.
+  const onDiskSkillDirs = readdirSync(cfg.skillsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.') &&
+      existsSync(join(cfg.skillsDir, entry.name, 'SKILL.md')))
+    .map((entry) => join(cfg.skillsDir, entry.name))
+    .sort()
+  assert.ok(onDiskSkillDirs.length > 0, 'the vendor tree ships skill directories at ' + cfg.skillsDir)
   const list = await captured.provider.list({})
-  assert.equal(list.length, 14, 'all 14 skills discovered')
+  assert.deepEqual(
+    list.map((skill) => skill.locator).sort(),
+    onDiskSkillDirs,
+    'discovery covers exactly the on-disk skill directories',
+  )
   const first = await captured.provider.get(list[0], {})
   assert.ok(typeof first.content === 'string' && first.content.length > 0, 'body loads without frontmatter')
 })

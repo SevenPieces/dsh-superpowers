@@ -23,6 +23,24 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const REPO_URL = 'https://github.com/obra/superpowers';
 
+/**
+ * Match the userinfo part of a URL (scheme://<userinfo>@host). The userinfo
+ * class excludes whitespace and '/', and is greedy, so a password containing
+ * '@' is masked whole: the last '@' before the next '/' ends the userinfo.
+ */
+const URL_USERINFO = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/]+@/g;
+
+/**
+ * Mask URL userinfo, which can carry a token or a password, in text about to
+ * be logged. Plain URLs (no userinfo) and scp-like ssh remotes are unchanged.
+ * @param {string} text - text that may embed URLs with credentials.
+ * @returns {string} the text with every URL userinfo replaced by "***".
+ */
+export function redactCredentials(text) {
+  if (typeof text !== 'string' || text === '') return text;
+  return text.replace(URL_USERINFO, '$1***@');
+}
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const PLUGIN_DIR = resolve(HERE, '..');
 export const DEFAULT_VENDOR_DIR = join(PLUGIN_DIR, 'vendor', 'superpowers');
@@ -149,18 +167,31 @@ function fail(message) {
   throw new Error(message);
 }
 
-/** One-line cause for a failed captured git call, without inventing a reason. */
+/**
+ * One-line cause for a failed captured git call, without inventing a reason.
+ * Credentials embedded in a remote URL are masked before the line is logged.
+ */
 function gitFailureCause(result) {
-  if (result.error) return result.error.message;
+  if (result.error) return redactCredentials(result.error.message);
   const detail = (result.stderr ?? '')
     .split(String.fromCharCode(10))
     .map((line) => line.trim())
     .find((line) => line !== '');
-  return detail ?? `git exited ${result.status ?? 'null'}`;
+  return detail === undefined ? `git exited ${result.status ?? 'null'}` : redactCredentials(detail);
 }
 
-/** Clone on first run, fetch tags, and check out the newest tag. */
-export function updateSkills(vendorDir) {
+/**
+ * Clone on first run, fetch tags, and check out the newest tag.
+ * @param {string} vendorDir - vendor checkout directory.
+ * @param {string} [repoUrl] - source repository URL, used for the first-run
+ *   clone only (later runs fetch tags from the checkout's origin). Defaults to
+ *   REPO_URL; an empty or non-string override is rejected rather than cloned.
+ * @returns {number} 0 on success; throws on any failed git step.
+ */
+export function updateSkills(vendorDir, repoUrl = REPO_URL) {
+  if (typeof repoUrl !== 'string' || repoUrl.trim() === '') {
+    fail('repoUrl must be a non-empty string')
+  }
   if (existsSync(vendorDir) && !isGitCheckout(vendorDir)) {
     fail(`vendor directory exists but is not a git checkout: ${vendorDir}\n` +
       'Remove it or pass a different --dir, then retry.');
@@ -168,10 +199,10 @@ export function updateSkills(vendorDir) {
 
   if (!isGitCheckout(vendorDir)) {
     mkdirSync(dirname(vendorDir), { recursive: true });
-    console.error(`[dsh-superpowers] cloning ${REPO_URL} -> ${vendorDir}`);
-    const clone = runGit(['clone', '--depth', '1', REPO_URL, vendorDir], dirname(vendorDir));
+    console.error(`[dsh-superpowers] cloning ${redactCredentials(repoUrl)} -> ${vendorDir}`);
+    const clone = runGit(['clone', '--depth', '1', repoUrl, vendorDir], dirname(vendorDir));
     if (clone.status !== 0) {
-      fail(`git clone failed (exit ${clone.status ?? 'null'}) for ${REPO_URL}`);
+      fail(`git clone failed (exit ${clone.status ?? 'null'}) for ${redactCredentials(repoUrl)}`);
     }
   }
 
