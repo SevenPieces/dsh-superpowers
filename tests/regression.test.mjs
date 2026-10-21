@@ -752,3 +752,118 @@ test('R3-F2: updateSkills succeeds when fetch output exceeds 1 MiB (large legal 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// R4-F1 (round 5): git output is replayed in bounded chunks, and an over-bound
+// (ENOBUFS) capture is not replayed at all - neither may crash the stream.
+
+/** A POSIX fake 'git' that floods stderr with newline-dense bytes, then fails. */
+function makeNewlineDenseGitShim(root, byteCount) {
+  const shimDir = join(root, 'shim');
+  mkdirSync(shimDir);
+  const shimPath = join(shimDir, 'git');
+  writeFileSync(
+    shimPath,
+    '#!/bin/sh' + LF + 'yes A | head -c ' + byteCount + ' >&2' + LF + 'exit 1' + LF,
+  );
+  chmodSync(shimPath, 0o755);
+  return { shimDir };
+}
+
+/** Node -e source: run updateSkills, mark a caught error, and probe for a checkout. */
+function updateSkillsChildScript() {
+  const binUrl = pathToFileURL(join(PLUGIN_DIR, 'bin', 'dsh-superpowers.mjs')).href;
+  return [
+    'import { existsSync } from "node:fs";',
+    'import { updateSkills } from ' + JSON.stringify(binUrl) + ';',
+    'try { updateSkills(process.env.VENDOR_DIR, process.env.REMOTE_URL); console.log("MARKER:NOERROR"); process.exitCode = 0; }',
+    'catch (error) { console.log("MARKER:CAUGHT:" + (error && error.message)); process.exitCode = 7; }',
+    'console.log("CHECKOUT:" + existsSync(process.env.VENDOR_DIR + "/.git"));',
+  ].join(LF);
+}
+
+/** Run the updateSkills child behind a PATH shim, capturing up to 64 MiB. */
+function runUpdateSkillsChild({ shimDir, vendor, repoUrl }) {
+  return spawnSync(process.execPath, ['--input-type=module', '-e', updateSkillsChildScript()], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: shimDir + ':' + process.env.PATH,
+      VENDOR_DIR: vendor,
+      REMOTE_URL: repoUrl,
+    },
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
+/** Assertions shared by both newline-dense cases: no stream-error signature. */
+function assertNoStreamError(combined, label) {
+  const sample = JSON.stringify(combined.slice(0, 300));
+  assert.ok(!combined.includes('EINVAL'), label + ': no EINVAL stream error: ' + sample);
+  assert.ok(!combined.includes("Unhandled 'error' event"), label + ': no unhandled stream error event: ' + sample);
+  assert.ok(!combined.includes('throw er;'), label + ': no uncaught stream error throw: ' + sample);
+  assert.doesNotMatch(combined, /^\s+at .*node:/m, label + ': no Node internal stack from a stream error');
+}
+
+test('R4-F1: newline-dense output beyond the capture bound fails closed without EINVAL or a giant replay', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-enobufs-'));
+  try {
+    // 17,000,000 bytes > the implementation's 16 MiB capture bound.
+    const { shimDir } = makeNewlineDenseGitShim(root, 17000000);
+    const vendor = join(root, 'fresh', 'vendor');
+    const repoUrl = 'file://' + join(root, 'unused.git');
+
+    const started = Date.now();
+    const child = runUpdateSkillsChild({ shimDir, vendor, repoUrl });
+    const elapsed = Date.now() - started;
+    const combined = (child.stdout ?? '') + (child.stderr ?? '');
+    const outputBytes = Buffer.byteLength(combined, 'utf8');
+
+    assert.notEqual(child.status, 0, 'the run fails closed: ' + JSON.stringify(combined.slice(0, 400)));
+    assert.match(child.stdout ?? '', /MARKER:CAUGHT:/, 'the child caught and marked the error: ' + JSON.stringify(child.stdout));
+    assert.match(combined, /git clone failed/, 'the failure diagnostic names the clone step: ' + JSON.stringify(combined.slice(0, 400)));
+    assertNoStreamError(combined, 'above-cap');
+    assert.match(child.stdout ?? '', /CHECKOUT:false/, 'no checkout is left behind: ' + JSON.stringify(child.stdout));
+    assert.ok(!existsSync(join(vendor, '.git')), 'no checkout exists on disk');
+
+    // ENOBUFS means the captured text is incomplete: replaying it is wrong, so
+    // the oversized capture must not reach the terminal.
+    assert.ok(outputBytes < 1024 * 1024, 'the incomplete capture is not replayed; output ' + outputBytes + ' bytes');
+    assert.ok(elapsed < 30000, 'the run fails fast; elapsed ' + elapsed + 'ms');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('R4-F1: below-cap newline-dense output is replayed in chunks without stream errors', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-chunked-'));
+  try {
+    // 2 MiB is below the 16 MiB capture bound, so it is captured and replayed.
+    const byteCount = 2 * 1024 * 1024;
+    const { shimDir } = makeNewlineDenseGitShim(root, byteCount);
+    const vendor = join(root, 'fresh', 'vendor');
+    const repoUrl = 'file://' + join(root, 'unused.git');
+
+    const started = Date.now();
+    const child = runUpdateSkillsChild({ shimDir, vendor, repoUrl });
+    const elapsed = Date.now() - started;
+    const combined = (child.stdout ?? '') + (child.stderr ?? '');
+    const stderrBytes = Buffer.byteLength(child.stderr ?? '', 'utf8');
+
+    assert.notEqual(child.status, 0, 'the clone still fails: ' + JSON.stringify(combined.slice(0, 400)));
+    assert.match(child.stdout ?? '', /MARKER:CAUGHT:/, 'the child caught and marked the error: ' + JSON.stringify(child.stdout));
+    assert.match(combined, /git clone failed/, 'the failure diagnostic names the clone step');
+    assertNoStreamError(combined, 'below-cap');
+    assert.match(child.stdout ?? '', /CHECKOUT:false/, 'no checkout is left behind: ' + JSON.stringify(child.stdout));
+
+    // Chunked replay preserves the full below-bound output and its line structure.
+    assert.ok(stderrBytes >= byteCount * 0.9, 'the newline-dense output is preserved; got ' + stderrBytes + ' bytes');
+    let newlineCount = 0;
+    for (let index = 0; index < (child.stderr ?? '').length; index += 1) {
+      if (child.stderr.charCodeAt(index) === 10) newlineCount += 1;
+    }
+    assert.ok(newlineCount > 500000, 'the line structure is preserved; got ' + newlineCount + ' newlines');
+    assert.ok(elapsed < 30000, 'the replay is bounded; elapsed ' + elapsed + 'ms');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -74,6 +74,13 @@ const DEFAULT_GIT_TIMEOUT_MS = 300000;
 const GIT_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
 
 /**
+ * Flush threshold for replayed git output. Escaped text is accumulated and
+ * written in chunks of roughly this size instead of one write per line, so a
+ * newline-dense stream cannot turn into millions of stream.write calls.
+ */
+const GIT_REPLAY_CHUNK_BYTES = 64 * 1024;
+
+/**
  * Resolve the per-git-step timeout. A positive safe integer in
  * DSH_SUPERPOWERS_GIT_TIMEOUT_MS overrides the default; any other value is
  * ignored, so a malformed variable cannot disable the bound.
@@ -198,18 +205,34 @@ function isGitCheckout(dir) {
 
 /**
  * Reprint captured git output on a local stream, escaping control and bidi
- * characters but preserving the line structure: an escaped line still ends
- * with a real newline, so normal multi-line output stays multi-line.
+ * characters while preserving line structure. LF/CRLF separators are written
+ * unchanged (so normal multi-line output stays multi-line); a bare CR is
+ * escaped like any other control character. Escaped text is accumulated and
+ * flushed in GIT_REPLAY_CHUNK_BYTES-sized chunks, so a newline-dense stream
+ * costs a bounded number of writes instead of one per line.
  * @param {NodeJS.WriteStream} stream - destination stream.
  * @param {string | null | undefined} text - captured git output.
  */
 function replaySanitized(stream, text) {
   if (typeof text !== 'string' || text === '') return;
+  let chunk = '';
+  let chunkBytes = 0;
+  const append = (value) => {
+    if (value === '') return;
+    chunk += value;
+    chunkBytes += Buffer.byteLength(value);
+    if (chunkBytes >= GIT_REPLAY_CHUNK_BYTES) {
+      stream.write(chunk);
+      chunk = '';
+      chunkBytes = 0;
+    }
+  };
   for (const part of text.split(/(\r?\n)/)) {
     if (part === '') continue;
-    if (part === '\n' || part === '\r\n') stream.write(part);
-    else stream.write(escapeControlChars(part));
+    if (part === '\n' || part === '\r\n') append(part);
+    else append(escapeControlChars(part));
   }
+  if (chunk !== '') stream.write(chunk);
 }
 
 /**
@@ -226,7 +249,9 @@ function stripTrailingNewlines(text) {
 /**
  * Run git with captured streams and replay the output through
  * escapeControlChars. Capture is bounded by GIT_MAX_BUFFER_BYTES: a large
- * legitimate tag set is accepted, pathological output fails closed.
+ * legitimate tag set is accepted, while output past the bound fails closed.
+ * On a capture-bound overflow (ENOBUFS) the captured text is incomplete, so
+ * replay is skipped and the caller's step diagnostic reports the overflow.
  * @param {string[]} args - git arguments.
  * @param {string} cwd - working directory for the step.
  * @param {object} [env] - environment (defaults to process.env).
@@ -243,8 +268,13 @@ function runGit(args, cwd, env) {
     timeout: gitTimeoutMs(),
     maxBuffer: GIT_MAX_BUFFER_BYTES,
   });
-  replaySanitized(process.stdout, result.stdout);
-  replaySanitized(process.stderr, result.stderr);
+  // ENOBUFS means stdout/stderr are truncated mid-stream: replaying the prefix
+  // would print a forged partial log and can trip a stream write error. Skip
+  // the replay; the step's failure diagnostic names the overflow instead.
+  if (result.error?.code !== 'ENOBUFS') {
+    replaySanitized(process.stdout, result.stdout);
+    replaySanitized(process.stderr, result.stderr);
+  }
   return result;
 }
 
