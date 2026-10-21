@@ -358,3 +358,48 @@ test('R1: apply() escapes a newline-bearing skillsDir in its info line', () => {
     cleanup(root)
   }
 })
+
+// ------------------------------------------------------------------ NEW-2 (round 3)
+
+test('NEW-2: entry/candidate names with bidi marks and zero-widths are escaped in diagnostics', async () => {
+  const root = makeTempDir()
+  const skillsDir = join(root, 'skills')
+  // U+061C (Arabic letter mark), U+200E/U+200F (LRM/RLM), U+200B (zero-width
+  // space), U+FEFF (BOM/zero-width no-break space).
+  const marks = [
+    ['061c', String.fromCharCode(0x061c)],
+    ['200e', String.fromCharCode(0x200e)],
+    ['200f', String.fromCharCode(0x200f)],
+    ['200b', String.fromCharCode(0x200b)],
+    ['feff', String.fromCharCode(0xfeff)],
+  ]
+  const suffix = marks.map(([, mark]) => mark).join('')
+  try {
+    // A missing SKILL.md and an invalid frontmatter name both name the on-disk
+    // entry in a skip warning, so both reach the diagnostic surface.
+    mkdirSync(join(skillsDir, 'missing' + suffix), { recursive: true })
+    writeSkill(join(skillsDir, 'badname' + suffix), 'Bad Name', 'x', 'Body')
+
+    const warns = []
+    const provider = createSkillsProvider(
+      { skillsDir, providerName: 'superpowers', rank: 600 },
+      { warn: (message) => warns.push(message) },
+    )
+    await provider.list({})
+
+    const reported = warns.filter((message) => message.includes('skipped skill entry'))
+    assert.equal(reported.length, 2, 'both hostile entries are reported: ' + JSON.stringify(warns))
+    for (const [hex, mark] of marks) {
+      assert.ok(
+        !warns.some((message) => message.includes(mark)),
+        'raw U+' + hex + ' mark leaked into a diagnostic: ' + JSON.stringify(warns),
+      )
+      assert.ok(
+        warns.some((message) => message.includes(BACKSLASH + 'u{' + hex + '}')),
+        'U+' + hex + ' is escaped in unicode form: ' + JSON.stringify(warns),
+      )
+    }
+  } finally {
+    cleanup(root)
+  }
+})

@@ -43,10 +43,12 @@ export function redactCredentials(text) {
 
 /**
  * Characters that could forge or visually reorder a diagnostic line: C0
- * controls, DEL, C1 controls, line/paragraph separators, and bidi formatting
- * controls. A directory name or git error is vendor-influenced input.
+ * controls, DEL, C1 controls, the Arabic letter mark (U+061C), zero-width and
+ * bidirectional marks (U+200B-200F), line/paragraph separators, bidi
+ * formatting controls (U+202A-202E, U+2066-2069), and U+FEFF. A ref name,
+ * directory name or git error line is vendor-influenced input.
  */
-const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069]/g;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]/g;
 const CONTROL_ESCAPES = { '\n': '\\n', '\r': '\\r', '\t': '\\t' };
 
 /**
@@ -187,13 +189,35 @@ function isGitCheckout(dir) {
   return existsSync(dir) && existsSync(join(dir, '.git'));
 }
 
+/**
+ * Reprint captured git output on a local stream, escaping control and bidi
+ * characters but preserving the line structure: an escaped line still ends
+ * with a real newline, so normal multi-line output stays multi-line.
+ * @param {NodeJS.WriteStream} stream - destination stream.
+ * @param {string | null | undefined} text - captured git output.
+ */
+function replaySanitized(stream, text) {
+  if (typeof text !== 'string' || text === '') return;
+  for (const part of text.split(/(\r?\n)/)) {
+    if (part === '') continue;
+    if (part === '\n' || part === '\r\n') stream.write(part);
+    else stream.write(escapeControlChars(part));
+  }
+}
+
 function runGit(args, cwd, env) {
-  return spawnSync('git', args, {
+  // Capture instead of inheriting: git output can echo a vendor-controlled ref
+  // name, which must never reach the terminal raw.
+  const result = spawnSync('git', args, {
     cwd,
     env: env ?? process.env,
-    stdio: 'inherit',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    encoding: 'utf8',
     timeout: gitTimeoutMs(),
   });
+  replaySanitized(process.stdout, result.stdout);
+  replaySanitized(process.stderr, result.stderr);
+  return result;
 }
 
 function runGitCapture(args, cwd, env) {
@@ -279,14 +303,15 @@ export function updateSkills(vendorDir, repoUrl = REPO_URL) {
   }
   const safeTag = escapeControlChars(tag);
 
-  const rev = runGitCapture(['rev-list', '-n', '1', tag], vendorDir);
+  const tagRef = 'refs/tags/' + tag;
+  const rev = runGitCapture(['rev-list', '-n', '1', tagRef], vendorDir);
   const hash = (rev.stdout ?? '').trim();
   if (rev.status !== 0 || hash === '') {
     fail('could not resolve the commit for tag ' + safeTag + ' (' + gitFailureCause(rev) + ')');
   }
 
   console.error(`[dsh-superpowers] checking out ${safeTag}`);
-  const checkout = runGit(['checkout', '--force', tag], vendorDir);
+  const checkout = runGit(['checkout', '--force', tagRef], vendorDir);
   if (checkout.status !== 0) {
     fail(`git checkout ${safeTag} failed (${gitFailureCause(checkout)}) in ${safeVendorDir}`);
   }

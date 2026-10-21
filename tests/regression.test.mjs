@@ -9,6 +9,16 @@ import { inject, discoverSkills, apply, PLUGIN_DIR, resolveConfig } from '../lib
 import { updateSkills } from '../bin/dsh-superpowers.mjs';
 
 const LF = String.fromCharCode(10);
+const BACKSLASH = String.fromCharCode(92);
+const ESCAPED_BIDI = BACKSLASH + 'u{202e}';
+const ESCAPED_LINE_SEP = BACKSLASH + 'u{2028}';
+// Raw ESC, bidi formatting controls and line/paragraph separators: none of
+// these may reach a terminal line unescaped.
+const RAW_MARKS = new RegExp(
+  '[' + String.fromCharCode(0x001b, 0x2028, 0x2029) +
+  String.fromCharCode(0x202a) + '-' + String.fromCharCode(0x202e) +
+  String.fromCharCode(0x2066) + '-' + String.fromCharCode(0x2069) + ']',
+);
 
 /** Real git with commit/tag signing pinned off (F1 pattern). */
 function runGit(args, cwd) {
@@ -75,6 +85,30 @@ function makeTaggedBareRemote(root) {
   assert.equal(runGit(['tag', 'v2.0.0'], work).status, 0, 'v2.0.0 tagged');
   assert.equal(runGit(['push', '--tags', 'origin', 'HEAD'], work).status, 0, 'tags pushed');
   return { remote, url: pathToFileURL(remote).href };
+}
+
+/**
+ * A local bare remote carrying exactly one tag, however exotic or option-like
+ * the legal refname is. update-ref writes any legal refname, so '-x' works.
+ * @param {string} root - scratch directory.
+ * @param {string} tag - the single tag name.
+ * @returns {{ remote: string, url: string, work: string }} remote path, file: URL and work tree.
+ */
+function makeBareRemoteWithTag(root, tag) {
+  const remote = join(root, 'remote');
+  mkdirSync(remote);
+  assert.equal(runGit(['init', '--bare', remote]).status, 0, 'bare remote created');
+  const work = join(root, 'work');
+  assert.equal(runGit(['clone', remote, work]).status, 0, 'work clone created');
+  runGit(['config', 'user.email', 't@example.com'], work);
+  runGit(['config', 'user.name', 't'], work);
+  writeFileSync(join(work, 'f.txt'), 'a');
+  runGit(['add', 'f.txt'], work);
+  assert.equal(runGit(['commit', '-m', 'a'], work).status, 0, 'commit created');
+  assert.equal(runGit(['push', 'origin', 'HEAD'], work).status, 0, 'branch pushed');
+  assert.equal(runGit(['update-ref', 'refs/tags/' + tag, 'HEAD'], work).status, 0, 'tag created');
+  assert.equal(runGit(['push', 'origin', 'refs/tags/' + tag], work).status, 0, 'tag pushed');
+  return { remote, url: pathToFileURL(remote).href, work };
 }
 
 function makeCtx() {
@@ -471,6 +505,78 @@ test('V7-F2: DSH_SUPERPOWERS_GIT_TIMEOUT_MS bounds a hung git step and leaves no
 
     assert.ok(elapsed < 5000, 'the hung git step is bounded; elapsed ' + elapsed + 'ms');
     assert.equal(existsSync(join(vendor, '.git')), false, 'no checkout is left behind');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// NEW-1 (round 3): vendor-controlled ref text in git output and diagnostics must
+// be escaped; normal multi-line output must survive.
+
+test('NEW-1: updateSkills escapes a bidi/line-separator tag in its child-process output', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-gitout-'));
+  try {
+    const tag = 'v1.0.0' + String.fromCharCode(0x202e) + 'x' + String.fromCharCode(0x2028) + 'y';
+    const { url } = makeBareRemoteWithTag(root, tag);
+    const vendor = join(root, 'fresh', 'vendor');
+    const binUrl = pathToFileURL(join(PLUGIN_DIR, 'bin', 'dsh-superpowers.mjs')).href;
+    const script = [
+      'import { updateSkills } from ' + JSON.stringify(binUrl) + ';',
+      'process.exitCode = updateSkills(process.env.VENDOR_DIR, process.env.REMOTE_URL);',
+    ].join(LF);
+
+    // A child process has the real terminal streams: nothing can be swallowed by
+    // the in-process console object.
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf8',
+      env: { ...process.env, VENDOR_DIR: vendor, REMOTE_URL: url },
+    });
+
+    assert.equal(child.status, 0, 'the child succeeds: ' + child.stdout + child.stderr);
+    const combined = child.stdout + child.stderr;
+
+    // Raw bidi / line separators / ESC must never reach the terminal.
+    assert.doesNotMatch(combined, RAW_MARKS, 'raw control marks leaked to the output: ' + JSON.stringify(combined));
+
+    // Normal output stays multi-line: escaping must not flatten the log.
+    const normalLines = child.stdout.split(LF).filter((line) => line !== '');
+    assert.ok(normalLines.length >= 2, 'stdout stays multi-line: ' + JSON.stringify(child.stdout));
+    assert.ok(child.stdout.includes('Resolved superpowers tag:'), 'the resolved-tag line survives: ' + child.stdout);
+    assert.ok(child.stdout.includes('Commit:'), 'the commit line survives: ' + child.stdout);
+
+    // Captured git output is still printed (escaped), not dropped.
+    assert.ok(
+      combined.includes('HEAD is now at') || combined.includes('detached HEAD'),
+      'captured git output is still printed: ' + JSON.stringify(combined),
+    );
+
+    // Escaped forms are present.
+    assert.ok(combined.includes(ESCAPED_BIDI), 'the bidi override is escaped in output: ' + JSON.stringify(combined));
+    assert.ok(combined.includes(ESCAPED_LINE_SEP), 'the line separator is escaped in output: ' + JSON.stringify(combined));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// NEW-4 (round 3): a tag named like an option must be checked out through
+// refs/tags, never parsed as a git option.
+
+test('NEW-4: updateSkills checks out a legal tag named "-x" via refs/tags without an option error', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-tagopt-'));
+  try {
+    const { url, work } = makeBareRemoteWithTag(root, '-x');
+    assert.equal(runGit(['tag'], work).stdout.trim(), '-x', 'the remote carries exactly the option-like tag');
+
+    const vendor = join(root, 'fresh', 'vendor');
+    assert.equal(updateSkills(vendor, url), 0);
+
+    assert.ok(existsSync(join(vendor, '.git')), 'a checkout exists');
+    assert.equal(runGit(['describe', '--tags'], vendor).stdout.trim(), '-x', 'the option-like tag is checked out');
+    assert.equal(
+      runGit(['rev-parse', 'HEAD'], vendor).stdout.trim(),
+      runGit(['rev-parse', 'refs/tags/-x'], vendor).stdout.trim(),
+      'HEAD is exactly the tagged commit',
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

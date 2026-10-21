@@ -29,7 +29,7 @@ The profile-mutating form (`dsh plugin ... exec`) needs write access to the inst
 node bin/dsh-superpowers.mjs update-skills --dir <writable vendor checkout>
 ```
 
-Each git step this CLI runs - clone, fetch, tag lookup, checkout, and status's describe - is bounded by a timeout: five minutes by default, overridable with a positive-integer `DSH_SUPERPOWERS_GIT_TIMEOUT_MS`.
+Each git step this CLI runs - clone, fetch, tag lookup, checkout, and status's describe - is bounded by a timeout: five minutes by default, overridable with a positive-integer `DSH_SUPERPOWERS_GIT_TIMEOUT_MS`. Git's own output is captured and reprinted with control and bidi characters escaped, so vendor-controlled ref text cannot rewrite the terminal. A timed-out step kills the direct git child; processes it spawned may briefly survive.
 
 A skills-content upgrade takes effect on the next model request, without reloading the plugin: the bootstrap section provider re-reads the vendor tree at each assembly, and each skill body is re-read on every lookup. The harness does cache the discovered catalog (skill names and descriptions) until that cache is invalidated, so adding, removing or renaming a skill directory may not show up in an already-running session until then.
 
