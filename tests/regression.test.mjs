@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { pathToFileURL } from 'node:url';
 import { inject, discoverSkills, apply, PLUGIN_DIR, resolveConfig } from '../lib/index.js';
 import { updateSkills } from '../bin/dsh-superpowers.mjs';
@@ -981,6 +982,208 @@ test('R7-F1: a credential-bearing git error line is redacted in the replayed str
     assert.ok(!combined.includes('user:supersecret'), 'the userinfo pair never reaches the output');
     assertNoStreamError(combined, 'credential replay');
     assert.ok(!existsSync(join(vendor, '.git')), 'no checkout is left behind');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Round 9 (AR-1..AR-6): EPIPE-tolerant CLI, SIGKILL timeout, non-UTF-8 refs,
+// column-proof tag listing, and CLI-level below-cap replay.
+// ---------------------------------------------------------------------------
+
+test('AR-1: a closed stdout reader (EPIPE) does not crash the CLI replay', { skip: process.platform === 'win32' }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-epipe-'));
+  try {
+    const shimDir = join(root, 'shim');
+    mkdirSync(shimDir);
+    const shimPath = join(shimDir, 'git');
+    // 2 MiB of newline-dense output on STDOUT, so the replayed stream is big
+    // enough to hit a closed pipe; then the clone fails.
+    writeFileSync(shimPath, '#!/bin/sh' + LF + 'yes A | head -c 2097152' + LF + 'exit 1' + LF);
+    chmodSync(shimPath, 0o755);
+
+    const child = spawn(
+      process.execPath,
+      [join(PLUGIN_DIR, 'bin', 'dsh-superpowers.mjs'), 'update-skills', '--dir', join(root, 'vendor')],
+      { env: { ...process.env, PATH: shimDir + ':' + process.env.PATH }, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.stdout.on('error', () => {}); // the parent read side closing is expected
+    child.stdout.destroy(); // closed reader: every replay write should EPIPE
+
+    const [code] = await once(child, 'close');
+
+    assert.equal(code, 1, 'the CLI still exits with the git-failure code: ' + JSON.stringify(stderr.slice(0, 300)));
+    assert.ok(stderr.includes('git clone failed'), 'the failure diagnostic is still produced: ' + JSON.stringify(stderr.slice(0, 300)));
+    assert.ok(!stderr.includes('EPIPE'), 'no EPIPE reaches stderr: ' + JSON.stringify(stderr.slice(0, 400)));
+    assert.ok(!stderr.includes("Unhandled 'error' event"), 'no unhandled stream error event: ' + JSON.stringify(stderr.slice(0, 400)));
+    assert.doesNotMatch(stderr, /^\s+at .*node:/m, 'no Node-internal stream stack');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('AR-3: a TERM-ignoring git child is SIGKILLed within the timeout bound', { skip: process.platform === 'win32', timeout: 15000 }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-sigkill-'));
+  try {
+    const shimDir = join(root, 'shim');
+    mkdirSync(shimDir);
+    const shimPath = join(shimDir, 'git');
+    // Ignore SIGTERM and outlive the 100 ms bound; only SIGKILL can stop it.
+    writeFileSync(
+      shimPath,
+      '#!/bin/sh' + LF + "trap '' TERM" + LF + 'sleep 3 </dev/null >/dev/null 2>&1' + LF + 'exit 1' + LF,
+    );
+    chmodSync(shimPath, 0o755);
+
+    const vendor = join(root, 'fresh', 'vendor');
+    let elapsed = 0;
+    withPatchedEnv({ PATH: shimDir + ':' + process.env.PATH, DSH_SUPERPOWERS_GIT_TIMEOUT_MS: '100' }, () => {
+      const started = Date.now();
+      assert.throws(
+        () => updateSkills(vendor, 'file://' + join(root, 'unused.git')),
+        (error) => {
+          assert.ok(error instanceof Error, 'a timed-out step still throws');
+          assert.match(error.message, /timed out/i, 'the failure names the timeout: ' + error.message);
+          return true;
+        },
+      );
+      elapsed = Date.now() - started;
+    });
+
+    assert.ok(elapsed < 1000, 'the TERM-trapping child is killed well inside 1 s; elapsed ' + elapsed + 'ms');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('AR-5: a tag whose name is invalid UTF-8 fails closed instead of selecting the U+FFFD twin', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-nonutf8-tag-'));
+  try {
+    const remote = join(root, 'remote');
+    mkdirSync(remote);
+    assert.equal(runGit(['init', '--bare', remote]).status, 0, 'bare remote created');
+    const work = join(root, 'work');
+    assert.equal(runGit(['clone', remote, work]).status, 0, 'work clone created');
+    runGit(['config', 'user.email', 't@example.com'], work);
+    runGit(['config', 'user.name', 't'], work);
+    writeFileSync(join(work, 'f.txt'), 'a');
+    runGit(['add', 'f.txt'], work);
+    assert.equal(runGit(['commit', '-m', 'a'], work).status, 0, 'tag target commit created');
+    const taggedSha = runGit(['rev-parse', 'HEAD'], work).stdout.trim();
+    // The branch tip is a different commit, so a silent tag checkout would move
+    // HEAD backwards and be observable.
+    writeFileSync(join(work, 'f.txt'), 'b');
+    runGit(['add', 'f.txt'], work);
+    assert.equal(runGit(['commit', '-m', 'b'], work).status, 0, 'branch tip commit created');
+    assert.equal(runGit(['push', 'origin', 'HEAD'], work).status, 0, 'branch pushed');
+
+    // A legal ref containing a raw 0xFF byte, plus the U+FFFD twin it would
+    // decode to: a utf8 decoder cannot tell them apart.
+    const twin = 'v2.0.0' + String.fromCharCode(0xfffd);
+    assert.equal(runGit(['update-ref', 'refs/tags/' + twin, taggedSha], work).status, 0, 'U+FFFD twin tag created');
+    const payload = Buffer.concat([
+      Buffer.from('create refs/tags/v2.0.0'),
+      Buffer.from([0xff]),
+      Buffer.from(' ' + taggedSha + LF),
+    ]);
+    const raw = spawnSync(
+      'git',
+      ['-c', 'commit.gpgsign=false', '-c', 'tag.gpgsign=false', 'update-ref', '--stdin'],
+      { cwd: work, input: payload },
+    );
+    assert.equal(raw.status, 0, 'non-UTF-8 tag created: ' + raw.stderr.toString());
+    assert.equal(
+      runGit(['push', '--quiet', 'origin', 'refs/tags/*:refs/tags/*'], work).status,
+      0,
+      'both tags pushed',
+    );
+
+    const vendor = join(root, 'fresh', 'vendor');
+    assert.throws(
+      () => updateSkills(vendor, pathToFileURL(remote).href),
+      (error) => {
+        assert.ok(error instanceof Error, 'a non-UTF-8 tag fails closed');
+        assert.match(
+          error.message,
+          /invalid|utf-?8|replacement|decode/i,
+          'the failure names the encoding problem: ' + error.message,
+        );
+        return true;
+      },
+      'a tag decoding to U+FFFD must not be checked out silently',
+    );
+    // Fails closed: the U+FFFD twin was never checked out, so HEAD still points
+    // at the branch tip rather than at the tagged (older) commit.
+    if (existsSync(join(vendor, '.git'))) {
+      assert.notEqual(
+        runGit(['rev-parse', 'HEAD'], vendor).stdout.trim(),
+        runGit(['rev-parse', 'refs/tags/' + twin], vendor).stdout.trim(),
+        'the U+FFFD twin is not checked out',
+      );
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('AR-6: column.ui=always does not break tag resolution', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-column-'));
+  try {
+    const { url } = makeTaggedBareRemote(root);
+    const gitConfig = join(root, 'gitconfig');
+    writeFileSync(gitConfig, '[column]' + LF + 'ui = always' + LF);
+    const vendor = join(root, 'fresh', 'vendor');
+
+    withPatchedEnv({ GIT_CONFIG_GLOBAL: gitConfig }, () => {
+      assert.equal(updateSkills(vendor, url), 0, 'the columnized tag listing still resolves');
+    });
+
+    assert.equal(
+      stripTrailingNewlines(runGit(['describe', '--tags'], vendor).stdout),
+      'v2.0.0',
+      'the newest version-sorted tag is checked out',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('AR-2: a below-cap newline-dense replay completes through the real CLI', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-cli-replay-'));
+  try {
+    const shimDir = join(root, 'shim');
+    mkdirSync(shimDir);
+    const shimPath = join(shimDir, 'git');
+    // 256 KiB is below the 16 MiB capture bound, so it must be replayed.
+    writeFileSync(shimPath, '#!/bin/sh' + LF + 'yes A | head -c 262144 >&2' + LF + 'exit 1' + LF);
+    chmodSync(shimPath, 0o755);
+
+    const result = spawnSync(
+      process.execPath,
+      [join(PLUGIN_DIR, 'bin', 'dsh-superpowers.mjs'), 'update-skills', '--dir', join(root, 'vendor')],
+      {
+        encoding: 'utf8',
+        env: { ...process.env, PATH: shimDir + ':' + process.env.PATH },
+        timeout: 15000,
+        maxBuffer: 64 * 1024 * 1024,
+      },
+    );
+    const combined = (result.stdout ?? '') + (result.stderr ?? '');
+
+    assert.equal(result.status, 1, 'the CLI exits with the git-failure code: ' + JSON.stringify(combined.slice(0, 200)));
+    assert.ok(combined.includes('git clone failed'), 'the failure diagnostic is present');
+    let newlineCount = 0;
+    for (let index = 0; index < combined.length; index += 1) {
+      if (combined.charCodeAt(index) === 10) newlineCount += 1;
+    }
+    assert.ok(newlineCount > 1000, 'the newline-dense replay reached the CLI streams; newlines ' + newlineCount);
+    assert.ok(!combined.includes('EINVAL'), 'no EINVAL stream error');
+    assert.ok(!combined.includes("Unhandled 'error' event"), 'no unhandled stream error event');
+    assert.doesNotMatch(combined, /^\s+at .*node:/m, 'no Node-internal stream stack');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

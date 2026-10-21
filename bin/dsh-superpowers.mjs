@@ -294,10 +294,11 @@ function isGitCheckout(dir) {
  * escaped like any other control character. Each non-newline part is first run
  * through redactCredentials, so a captured git line that echoes a
  * scheme://userinfo@host URL is masked in the replay just as it is in the
- * plugin's own diagnostics. Parts are complete lines, so a URL is never split.
- * Escaped text is accumulated and flushed in GIT_REPLAY_CHUNK_BYTES-sized
- * chunks, so a newline-dense stream costs a bounded number of writes instead
- * of one per line.
+ * plugin's own diagnostics. Lines are found with indexOf rather than
+ * split(): a full-text split array would multiply the memory of a large
+ * newline-dense capture. Escaped text is accumulated and flushed in
+ * GIT_REPLAY_CHUNK_BYTES-sized chunks, so a newline-dense stream costs a
+ * bounded number of writes instead of one per line.
  * @param {NodeJS.WriteStream} stream - destination stream.
  * @param {string | null | undefined} text - captured git output.
  */
@@ -315,10 +316,23 @@ function replaySanitized(stream, text) {
       chunkBytes = 0;
     }
   };
-  for (const part of text.split(/(\r?\n)/)) {
-    if (part === '') continue;
-    if (part === '\n' || part === '\r\n') append(part);
-    else append(escapeControlChars(redactCredentials(part)));
+  const length = text.length;
+  let start = 0;
+  while (start < length) {
+    let lf = text.indexOf('\n', start);
+    if (lf === -1) {
+      append(escapeControlChars(redactCredentials(text.slice(start))));
+      break;
+    }
+    let end = lf;
+    let separator = '\n';
+    if (end > start && text.charCodeAt(end - 1) === 0x0d) {
+      end -= 1;
+      separator = '\r\n';
+    }
+    if (end > start) append(escapeControlChars(redactCredentials(text.slice(start, end))));
+    append(separator);
+    start = lf + 1;
   }
   if (chunk !== '') stream.write(chunk);
 }
@@ -354,6 +368,7 @@ function runGit(args, cwd, env) {
     stdio: ['ignore', 'pipe', 'pipe'],
     encoding: 'utf8',
     timeout: gitTimeoutMs(),
+    killSignal: 'SIGKILL',
     maxBuffer: GIT_MAX_BUFFER_BYTES,
   });
   // ENOBUFS means stdout/stderr are truncated mid-stream: replaying the prefix
@@ -382,12 +397,34 @@ function runGitCapture(args, cwd, env) {
     stdio: ['ignore', 'pipe', 'pipe'],
     encoding: 'utf8',
     timeout: gitTimeoutMs(),
+    killSignal: 'SIGKILL',
     maxBuffer: GIT_MAX_BUFFER_BYTES,
   });
 }
 
 function fail(message) {
   throw new Error(message);
+}
+
+/**
+ * First non-empty, trimmed line of captured text, without a split/map array
+ * over every line: a huge newline-dense stderr must not be materialized.
+ * @param {string | null | undefined} text - captured output.
+ * @returns {string | undefined} the first non-empty trimmed line.
+ */
+function firstNonEmptyLine(text) {
+  if (typeof text !== 'string' || text === '') return undefined;
+  const length = text.length;
+  let start = 0;
+  while (start <= length) {
+    let end = text.indexOf('\n', start);
+    if (end === -1) end = length;
+    const line = text.slice(start, end).trim();
+    if (line !== '') return line;
+    if (end === length) return undefined;
+    start = end + 1;
+  }
+  return undefined;
 }
 
 /**
@@ -400,10 +437,7 @@ function fail(message) {
 function gitFailureCause(result) {
   if (result?.error?.code === 'ETIMEDOUT') return `timed out after ${gitTimeoutMs()} ms`;
   if (result.error) return escapeControlChars(redactCredentials(result.error.message));
-  const detail = (result.stderr ?? '')
-    .split(String.fromCharCode(10))
-    .map((line) => line.trim())
-    .find((line) => line !== '');
+  const detail = firstNonEmptyLine(result.stderr);
   if (detail === undefined) return `git exited ${result.status ?? 'null'}`;
   return escapeControlChars(redactCredentials(detail));
 }
@@ -452,12 +486,20 @@ export function updateSkills(vendorDir, repoUrl = REPO_URL) {
     fail(`git fetch --tags failed (${gitFailureCause(fetch)}) in ${safeVendorDir}`);
   }
 
-  const tagList = runGitCapture(['tag', '--sort=-v:refname'], vendorDir);
+  // --no-column keeps a user's column.ui/column.tag config from turning the
+  // listing into columns; the tag is parsed as exactly one line.
+  const tagList = runGitCapture(['tag', '--no-column', '--sort=-v:refname'], vendorDir);
   // Split on CRLF/LF and take the first non-empty line verbatim: trimming a
   // legal ref name that ends in a Unicode space would corrupt it.
   const tag = (tagList.stdout ?? '').split(/\r?\n/).find((line) => line !== '') ?? '';
   if (tagList.status !== 0 || tag === '') {
     fail(`could not resolve the newest tag from ${safeVendorDir} (${gitFailureCause(tagList)})`);
+  }
+  // Node decodes git's byte-named refs as UTF-8 with replacement. A U+FFFD in
+  // the selected tag means the real ref name is ambiguous (another ref can
+  // decode to the same string), so refuse instead of checking out a wrong ref.
+  if (tag.includes('\uFFFD')) {
+    fail(`could not resolve the newest tag from ${safeVendorDir}: the selected tag name is not valid UTF-8 (decoded with U+FFFD); refusing to check out a possibly wrong ref`);
   }
   const safeTag = escapeControlChars(tag);
 
@@ -523,8 +565,27 @@ export function status(vendorDir) {
   return 0;
 }
 
+/**
+ * Make CLI output tolerant of a closed reader. EPIPE and
+ * ERR_STREAM_DESTROYED mean the consumer went away (for example
+ * `... | head`), so they are ignored; any other stream error is rethrown.
+ * Installed once, so repeated main() calls do not stack listeners.
+ */
+let streamErrorHandlersInstalled = false;
+function installStreamErrorHandlers() {
+  if (streamErrorHandlersInstalled) return;
+  streamErrorHandlersInstalled = true;
+  for (const stream of [process.stdout, process.stderr]) {
+    stream.on('error', (error) => {
+      if (error?.code === 'EPIPE' || error?.code === 'ERR_STREAM_DESTROYED') return;
+      throw error;
+    });
+  }
+}
+
 /** CLI entry point. Returns the process exit code (0 on success). */
 export function main(argv = process.argv.slice(2)) {
+  installStreamErrorHandlers();
   let parsed;
   try {
     parsed = parseArgs(argv);
