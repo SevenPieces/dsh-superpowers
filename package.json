@@ -29,7 +29,8 @@
     "status": "node bin/dsh-superpowers.mjs status"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22",
+    "dsh": ">=0.2.1"
   },
   "license": "MIT"
 }
