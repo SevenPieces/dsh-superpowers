@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, symlinkSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -1244,18 +1244,22 @@ test('R9-1: a failed first-run clone removes the partial directory so a retry re
     const shimDir = join(root, 'shim');
     mkdirSync(shimDir);
     const shimPath = join(shimDir, 'git');
-    // Emulate a clone that creates a partial checkout, then fails.
+    // Emulate a clone that creates a partial checkout in its destination, then
+    // fails. The destination is the last argv element (the plugin may clone into
+    // a temporary sibling), so the fixture must not assume the final vendor path.
     writeFileSync(
       shimPath,
       '#!/bin/sh' + LF +
-        'mkdir -p "$VENDOR_DIR/.git"' + LF +
-        'echo partial > "$VENDOR_DIR/partial.txt"' + LF +
+        'for last in "$@"; do :; done' + LF +
+        'mkdir -p "$last/.git"' + LF +
+        'echo partial > "$last/partial.txt"' + LF +
         'exit 1' + LF,
     );
     chmodSync(shimPath, 0o755);
-    const vendor = join(root, 'fresh', 'vendor');
+    const parent = join(root, 'fresh');
+    const vendor = join(parent, 'vendor');
 
-    withPatchedEnv({ PATH: shimDir + ':' + process.env.PATH, VENDOR_DIR: vendor }, () => {
+    withPatchedEnv({ PATH: shimDir + ':' + process.env.PATH }, () => {
       assert.throws(
         () => updateSkills(vendor, 'file://' + join(root, 'nope.git')),
         /git clone failed/,
@@ -1263,6 +1267,7 @@ test('R9-1: a failed first-run clone removes the partial directory so a retry re
       );
     });
     assert.equal(existsSync(vendor), false, 'the plugin-created partial vendor directory is removed');
+    assert.deepEqual(readdirSync(parent), [], 'no temporary clone directory is left behind');
 
     const goodRoot = join(root, 'good');
     mkdirSync(goodRoot, { recursive: true });
@@ -1396,7 +1401,7 @@ test('R9-6: a 16 MiB tag listing still completes and selects its first line', { 
       [
         '#!/bin/sh',
         'case "$1" in',
-        '  clone) mkdir -p "$VENDOR_DIR/.git"; exit 0 ;;',
+        '  clone) for last in "$@"; do :; done; mkdir -p "$last/.git"; exit 0 ;;',
         '  fetch|checkout) echo "$@" >> "$GIT_LOG"; exit 0 ;;',
         '  tag) echo v9.9.9; yes x | head -c 16777209; exit 0 ;;',
         '  rev-list) echo 0123456789abcdef0123456789abcdef01234567; exit 0 ;;',
@@ -1408,7 +1413,7 @@ test('R9-6: a 16 MiB tag listing still completes and selects its first line', { 
     chmodSync(join(shimDir, 'git'), 0o755);
 
     let elapsed = 0;
-    withPatchedEnv({ PATH: shimDir + ':' + process.env.PATH, VENDOR_DIR: vendor, GIT_LOG: logPath }, () => {
+    withPatchedEnv({ PATH: shimDir + ':' + process.env.PATH, GIT_LOG: logPath }, () => {
       const started = Date.now();
       assert.equal(updateSkills(vendor, 'file://' + join(root, 'nope.git')), 0, 'the 16 MiB listing resolves');
       elapsed = Date.now() - started;
@@ -1420,6 +1425,207 @@ test('R9-6: a 16 MiB tag listing still completes and selects its first line', { 
       'the first line of the 16 MiB listing is selected: ' + JSON.stringify(calls.slice(0, 5)),
     );
     assert.ok(elapsed < 15000, 'the listing completes in reasonable time; elapsed ' + elapsed + 'ms');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Round 11 (R10-1, R10-2): clone-temp race safety, dangling symlink refusal,
+// bounded tag diagnostics, and the 16 MiB listing memory guard.
+// ---------------------------------------------------------------------------
+
+/** A POSIX fake 'git' whose behaviour is a case statement over its first argument. */
+function makeCaseGitShim(root, caseLines) {
+  const shimDir = join(root, 'shim');
+  mkdirSync(shimDir, { recursive: true });
+  const shimPath = join(shimDir, 'git');
+  writeFileSync(shimPath, '#!/bin/sh' + LF + 'case "$1" in' + LF + caseLines.join(LF) + LF + 'esac' + LF);
+  chmodSync(shimPath, 0o755);
+  return shimDir;
+}
+
+test('R10-1: a vendor directory that appears during the clone is kept and the clone fails clearly', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-clone-race-'));
+  try {
+    const shimDir = makeCaseGitShim(root, [
+      '  clone) for last in "$@"; do :; done; mkdir -p "$last/.git"; mkdir -p "$VENDOR_DIR"; echo concurrent > "$VENDOR_DIR/concurrent.txt"; exit 0 ;;',
+      '  fetch) exit 0 ;;',
+      '  tag) echo v1.0.0; exit 0 ;;',
+      '  rev-list) echo 0123456789abcdef0123456789abcdef01234567; exit 0 ;;',
+      '  checkout) exit 0 ;;',
+    ]);
+    const parent = join(root, 'fresh');
+    const vendor = join(parent, 'vendor');
+
+    withPatchedEnv({ PATH: shimDir + ':' + process.env.PATH, VENDOR_DIR: vendor }, () => {
+      assert.throws(
+        () => updateSkills(vendor, 'file://' + join(root, 'nope.git')),
+        (error) => {
+          assert.ok(error instanceof Error, 'the race fails closed');
+          assert.match(
+            error.message,
+            /appear|concurrent|already exists|existing|vendor dir|refus/i,
+            'the race failure is clear: ' + error.message,
+          );
+          return true;
+        },
+      );
+    });
+
+    assert.equal(
+      existsSync(join(vendor, 'concurrent.txt')),
+      true,
+      'the concurrently created vendor file survives',
+    );
+    assert.deepEqual(readdirSync(parent), ['vendor'], 'only the plugin-created temporary directory is removed');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('R10-1: a dangling symlink at vendorDir is refused and preserved', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-dangling-link-'));
+  try {
+    const parent = join(root, 'fresh');
+    mkdirSync(parent);
+    const vendor = join(parent, 'vendor');
+    const target = join(root, 'missing-target');
+    symlinkSync(target, vendor);
+    assert.equal(lstatSync(vendor).isSymbolicLink(), true, 'the fixture is a symlink');
+
+    assert.throws(
+      () => updateSkills(vendor, 'file://' + join(root, 'nope.git')),
+      (error) => {
+        assert.ok(error instanceof Error, 'an existing dangling symlink is refused');
+        assert.match(
+          error.message,
+          /symlink|symbolic|existing|refus|not a git|appear/i,
+          'the refusal is clear: ' + error.message,
+        );
+        return true;
+      },
+    );
+
+    assert.equal(lstatSync(vendor).isSymbolicLink(), true, 'the symlink is not replaced or removed');
+    assert.equal(readlinkSync(vendor), target, 'the symlink target is unchanged');
+    assert.equal(existsSync(target), false, 'the symlink target is not created');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('R10-1: a failed clone removes only its own temporary directory', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-temp-only-'));
+  try {
+    const shimDir = makeCaseGitShim(root, [
+      '  clone) for last in "$@"; do :; done; mkdir -p "$last/.git"; mkdir -p "$VENDOR_DIR"; echo concurrent > "$VENDOR_DIR/concurrent.txt"; exit 1 ;;',
+    ]);
+    const parent = join(root, 'fresh');
+    const vendor = join(parent, 'vendor');
+
+    withPatchedEnv({ PATH: shimDir + ':' + process.env.PATH, VENDOR_DIR: vendor }, () => {
+      assert.throws(
+        () => updateSkills(vendor, 'file://' + join(root, 'nope.git')),
+        /git clone failed/,
+        'the failed clone still reports the git failure',
+      );
+    });
+
+    assert.equal(
+      existsSync(join(vendor, 'concurrent.txt')),
+      true,
+      'the concurrently created vendor file survives a clone failure',
+    );
+    assert.deepEqual(readdirSync(parent), ['vendor'], 'no temporary clone directory is left behind');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('R10-2: a 1 MiB U+FFFD tag diagnostic is capped and marked as truncated', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-big-fffd-tag-'));
+  try {
+    const tagData = join(root, 'tag-data.bin');
+    writeFileSync(
+      tagData,
+      Buffer.concat([
+        Buffer.from('v1.0.0'),
+        Buffer.alloc(1048576, 'a'),
+        Buffer.from([0xef, 0xbf, 0xbd]),
+        Buffer.from(LF),
+      ]),
+    );
+    const shimDir = makeCaseGitShim(root, [
+      '  clone) for last in "$@"; do :; done; mkdir -p "$last/.git"; exit 0 ;;',
+      '  fetch) exit 0 ;;',
+      '  tag) cat "$TAG_DATA"; exit 0 ;;',
+      '  rev-list) echo 0123456789abcdef0123456789abcdef01234567; exit 0 ;;',
+      '  checkout) exit 0 ;;',
+    ]);
+    const vendor = join(root, 'fresh', 'vendor');
+
+    withPatchedEnv({ PATH: shimDir + ':' + process.env.PATH, TAG_DATA: tagData }, () => {
+      assert.throws(
+        () => updateSkills(vendor, 'file://' + join(root, 'nope.git')),
+        (error) => {
+          assert.ok(error instanceof Error, 'a huge U+FFFD tag fails closed');
+          assert.ok(
+            error.message.length < 1024,
+            'the diagnostic is capped, got ' + error.message.length + ' chars',
+          );
+          assert.match(error.message, /\.\.\.|…/, 'the capped diagnostic marks truncation');
+          assert.match(error.message, /chars|characters/i, 'the diagnostic reports the original length');
+          assert.ok(error.message.includes('v1.0.0'), 'the diagnostic still identifies the tag');
+          assert.match(
+            error.message,
+            /U\+FFFD|replacement|invalid.*utf-?8/i,
+            'the diagnostic explains the decoding problem: ' + error.message,
+          );
+          return true;
+        },
+      );
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('R9-6: the 16 MiB tag listing child stays under 250 MB maxRSS', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-16m-rss-'));
+  try {
+    const shimDir = makeCaseGitShim(root, [
+      '  clone) for last in "$@"; do :; done; mkdir -p "$last/.git"; exit 0 ;;',
+      '  fetch|checkout) exit 0 ;;',
+      '  tag) echo v9.9.9; yes x | head -c 16777209; exit 0 ;;',
+      '  rev-list) echo 0123456789abcdef0123456789abcdef01234567; exit 0 ;;',
+    ]);
+    const vendor = join(root, 'vendor');
+    const binUrl = pathToFileURL(join(PLUGIN_DIR, 'bin', 'dsh-superpowers.mjs')).href;
+    const script = [
+      'import { updateSkills } from ' + JSON.stringify(binUrl) + ';',
+      'let code = 0;',
+      'try { code = updateSkills(process.env.VENDOR_DIR, "file:///tmp/x"); } catch (error) { code = "threw:" + error.message.slice(0, 60); }',
+      'process.stdout.write("RESULT_JSON:" + JSON.stringify({ code, maxRSS: process.resourceUsage().maxRSS }) + "\\n");',
+    ].join(LF);
+
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: shimDir + ':' + process.env.PATH, VENDOR_DIR: vendor },
+      timeout: 60000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    assert.equal(child.status, 0, 'the maxRSS probe exits 0: ' + child.stderr);
+
+    const line = child.stdout.split(LF).find((entry) => entry.startsWith('RESULT_JSON:'));
+    assert.ok(line, 'the probe reports its result: ' + JSON.stringify(child.stdout.slice(0, 200)));
+    const result = JSON.parse(line.slice('RESULT_JSON:'.length));
+    assert.equal(result.code, 0, 'the 16 MiB listing resolves in the child');
+    assert.ok(result.maxRSS > 0, 'maxRSS is reported in KB: ' + result.maxRSS);
+    assert.ok(
+      result.maxRSS < 250 * 1024,
+      'the 16 MiB listing child stays under 250 MB; maxRSS ' + result.maxRSS + ' KB',
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

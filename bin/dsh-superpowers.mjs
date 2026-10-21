@@ -17,7 +17,7 @@
 // The vendored tree is never edited by this command; it only clones/fetches/checks out.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -133,7 +133,20 @@ export function redactCredentials(text) {
  * directory name or git error line is vendor-influenced input.
  */
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]/g;
-const CONTROL_ESCAPES = { '\n': '\\n', '\r': '\\r', '\t': '\\t' };
+/** Same class without the /g flag, for single-code-unit tests. */
+const CONTROL_CHAR = new RegExp(CONTROL_CHARS.source);
+
+/**
+ * Escape one UTF-16 code unit for a diagnostic.
+ * @param {number} code - UTF-16 code unit.
+ * @returns {string} named escape for tab/LF/CR, otherwise \u{xxxx}.
+ */
+function codeUnitEscape(code) {
+  if (code === 0x0a) return '\\n';
+  if (code === 0x0d) return '\\r';
+  if (code === 0x09) return '\\t';
+  return '\\u{' + code.toString(16).padStart(4, '0') + '}';
+}
 
 /**
  * Escape control characters before text reaches a log or console line.
@@ -141,8 +154,7 @@ const CONTROL_ESCAPES = { '\n': '\\n', '\r': '\\r', '\t': '\\t' };
  * @returns {string} the text with control characters escaped.
  */
 function escapeControlChars(value) {
-  return String(value).replace(CONTROL_CHARS, (char) =>
-    CONTROL_ESCAPES[char] ?? '\\u{' + char.charCodeAt(0).toString(16).padStart(4, '0') + '}');
+  return String(value).replace(CONTROL_CHARS, (char) => codeUnitEscape(char.charCodeAt(0)));
 }
 
 /** Environment override for the per-git-step bound. */
@@ -288,6 +300,21 @@ function isGitCheckout(dir) {
 }
 
 /**
+ * lstat a path without following symlinks, so a dangling link still counts as
+ * an existing entry.
+ * @param {string} target - path to inspect.
+ * @returns {import('node:fs').Stats | null} stats, or null when nothing exists at the path.
+ */
+function lstatOrNull(target) {
+  try {
+    return lstatSync(target);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+/**
  * Reprint captured git output on a local stream, escaping control and bidi
  * characters while preserving line structure. LF/CRLF separators are written
  * unchanged (so normal multi-line output stays multi-line); a bare CR is
@@ -371,15 +398,34 @@ function firstTagLine(text) {
   return '';
 }
 
+/** Rendered-character cap for a tag name in a diagnostic. */
+const TAG_DIAGNOSTIC_LIMIT = 120;
+
 /**
- * Render a tag name for a diagnostic: control/bidi characters are escaped and
- * U+FFFD is spelled out, because it signals a decoding replacement rather than
- * a character that was really in the ref name.
+ * Render a tag name for a diagnostic. Control/bidi characters are escaped,
+ * U+FFFD is spelled out (it signals a decoding replacement rather than a
+ * character that was really in the ref name), and the rendered name is capped
+ * at TAG_DIAGNOSTIC_LIMIT characters with a "... (N chars)" suffix so a huge
+ * ref name cannot multiply into a huge diagnostic. The scan is linear and
+ * stops as soon as the cap is reached.
  * @param {string} tag - selected or described tag name.
- * @returns {string} the diagnostic display form.
+ * @returns {string} the capped diagnostic display form.
  */
 function escapeTagName(tag) {
-  return escapeControlChars(tag).split('\uFFFD').join('\\u{fffd}');
+  const text = String(tag);
+  let out = '';
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    let piece;
+    if (code === 0xfffd) piece = '\\u{fffd}';
+    else if (CONTROL_CHAR.test(text[i])) piece = codeUnitEscape(code);
+    else piece = text[i];
+    if (out.length + piece.length > TAG_DIAGNOSTIC_LIMIT) {
+      return out + '... (' + text.length + ' chars)';
+    }
+    out += piece;
+  }
+  return out;
 }
 
 /**
@@ -501,26 +547,45 @@ export function updateSkills(vendorDir, repoUrl = REPO_URL) {
   }
   const safeVendorDir = escapeControlChars(vendorDir);
   const safeCloneUrl = escapeControlChars(redactCredentials(cloneUrl));
-  if (existsSync(vendorDir) && !isGitCheckout(vendorDir)) {
+  // lstat, not existsSync: a dangling symlink still occupies the path and must
+  // be refused rather than followed or replaced.
+  if (lstatOrNull(vendorDir) !== null && !isGitCheckout(vendorDir)) {
     fail(`vendor directory exists but is not a git checkout: ${safeVendorDir}\n` +
       'Remove it or pass a different --dir, then retry.')
   }
 
   if (!isGitCheckout(vendorDir)) {
-    const existedBefore = existsSync(vendorDir);
-    mkdirSync(dirname(vendorDir), { recursive: true });
-    console.error(`[dsh-superpowers] cloning ${safeCloneUrl} -> ${safeVendorDir}`);
-    const clone = runGit(['clone', '--depth', '1', '--', cloneUrl, vendorDir], dirname(vendorDir));
-    if (clone.status !== 0) {
-      // A failed first-run clone can leave a partial target behind; remove it
-      // only when this run created the directory, so a retry can re-clone and a
-      // pre-existing directory is never destroyed.
-      if (!existedBefore) {
-        try {
-          rmSync(vendorDir, { recursive: true, force: true });
-        } catch { /* best effort: the clone failure below is the real diagnostic */ }
+    const parent = dirname(vendorDir);
+    mkdirSync(parent, { recursive: true });
+    // Clone into a unique temporary sibling and rename it into place only on
+    // success: the plugin then only ever removes the temp path it created, and
+    // a pre-existing path or one that appears during the clone is preserved.
+    const tempDir = mkdtempSync(join(parent, '.dsh-superpowers-clone-'));
+    let moved = false;
+    try {
+      console.error(`[dsh-superpowers] cloning ${safeCloneUrl} -> ${safeVendorDir}`);
+      const clone = runGit(['clone', '--depth', '1', '--', cloneUrl, tempDir], parent);
+      if (clone.status !== 0) {
+        fail(`git clone failed (${gitFailureCause(clone)}) for ${safeCloneUrl}`);
       }
-      fail(`git clone failed (${gitFailureCause(clone)}) for ${safeCloneUrl}`);
+      if (lstatOrNull(vendorDir) !== null) {
+        fail(`vendor path appeared while cloning: ${safeVendorDir}; refusing to replace it. Remove it and retry.`);
+      }
+      try {
+        renameSync(tempDir, vendorDir);
+      } catch (error) {
+        if (error?.code === 'EEXIST' || error?.code === 'ENOTEMPTY' || error?.code === 'ENOTDIR') {
+          fail(`vendor path appeared while cloning: ${safeVendorDir}; refusing to replace it. Remove it and retry.`);
+        }
+        throw error;
+      }
+      moved = true;
+    } finally {
+      if (!moved) {
+        try {
+          rmSync(tempDir, { recursive: true, force: true });
+        } catch { /* best effort: the clone/rename failure is the real diagnostic */ }
+      }
     }
   }
 
