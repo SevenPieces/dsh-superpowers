@@ -24,21 +24,105 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 export const REPO_URL = 'https://github.com/obra/superpowers';
 
 /**
- * Match the userinfo part of a URL (scheme://<userinfo>@host). The userinfo
- * class excludes whitespace and '/', and is greedy, so a password containing
- * '@' is masked whole: the last '@' before the next '/' ends the userinfo.
+ * One UTF-16 code unit of the scheme character set the original pattern used:
+ * ASCII letters, digits, '+', '-' and '.'.
+ * @param {number} code - UTF-16 code unit.
+ * @returns {boolean} whether it may appear inside a scheme.
  */
-const URL_USERINFO = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/]+@/g;
+function isSchemeChar(code) {
+  return (code >= 0x61 && code <= 0x7a) || (code >= 0x41 && code <= 0x5a) ||
+    (code >= 0x30 && code <= 0x39) || code === 0x2b || code === 0x2d || code === 0x2e;
+}
+
+/**
+ * @param {number} code - UTF-16 code unit.
+ * @returns {boolean} whether it is an ASCII letter, the only legal first scheme unit.
+ */
+function isAsciiLetter(code) {
+  return (code >= 0x61 && code <= 0x7a) || (code >= 0x41 && code <= 0x5a);
+}
+
+/**
+ * One code unit allowed in URL userinfo by the original [^\s/] class: every
+ * character except '/' and the ECMAScript \s set (tab/LF/VT/FF/CR, space,
+ * NBSP, OGHAM SPACE MARK, U+2000-200A, LS/PS, U+202F, U+205F, U+3000, U+FEFF).
+ * @param {number} code - UTF-16 code unit.
+ * @returns {boolean} whether userinfo may contain it.
+ */
+function isUserinfoChar(code) {
+  if (code === 0x2f) return false; // '/'
+  if (code >= 0x09 && code <= 0x0d) return false; // tab, LF, VT, FF, CR
+  if (code === 0x20 || code === 0xa0 || code === 0x1680) return false; // space, NBSP, OGHAM SPACE MARK
+  if (code >= 0x2000 && code <= 0x200a) return false; // en/em and other spaces
+  if (code === 0x2028 || code === 0x2029 || code === 0x202f ||
+    code === 0x205f || code === 0x3000 || code === 0xfeff) return false;
+  return true;
+}
 
 /**
  * Mask URL userinfo, which can carry a token or a password, in text about to
  * be logged. Plain URLs (no userinfo) and scp-like ssh remotes are unchanged.
+ *
+ * Semantics match the original scheme://<userinfo>@ pattern: the scheme starts
+ * with an ASCII letter and otherwise uses [a-zA-Z0-9+.-]; userinfo is the run
+ * of non-whitespace, non-'/' characters and is greedy, so the last '@' in that
+ * run is the delimiter (a password may contain '@').
+ *
+ * Fast path: without both "://" and "@" no match is possible, so the text is
+ * returned untouched after two native O(n) scans.
+ *
+ * The scanner is linear: each '://' occurrence is visited at most once, the
+ * scheme run is walked back, the userinfo segment is scanned once while
+ * tracking the last '@', and after a segment without a usable '@' the scan
+ * resumes at the segment end (minus the ':' that could begin a nested '://'),
+ * so no segment is rescanned.
+ *
  * @param {string} text - text that may embed URLs with credentials.
  * @returns {string} the text with every URL userinfo replaced by "***".
  */
 export function redactCredentials(text) {
   if (typeof text !== 'string' || text === '') return text;
-  return text.replace(URL_USERINFO, '$1***@');
+  if (!text.includes('://') || !text.includes('@')) return text;
+
+  let out = '';
+  let copied = 0;
+  let search = 0;
+  while (true) {
+    const proto = text.indexOf('://', search);
+    if (proto === -1) break;
+
+    // Walk back over the scheme run; the match must start at an ASCII letter.
+    let runStart = proto;
+    while (runStart > 0 && isSchemeChar(text.charCodeAt(runStart - 1))) runStart -= 1;
+    let schemeStart = runStart;
+    while (schemeStart < proto && !isAsciiLetter(text.charCodeAt(schemeStart))) schemeStart += 1;
+    if (schemeStart >= proto) {
+      search = proto + 1;
+      continue;
+    }
+
+    // Scan the userinfo segment once, remembering the last '@'.
+    const userinfoStart = proto + 3;
+    let end = userinfoStart;
+    let lastAt = -1;
+    while (end < text.length) {
+      const code = text.charCodeAt(end);
+      if (!isUserinfoChar(code)) break;
+      if (code === 0x40) lastAt = end;
+      end += 1;
+    }
+    if (lastAt > userinfoStart) {
+      out += text.slice(copied, schemeStart) + text.slice(schemeStart, userinfoStart) + '***@';
+      copied = lastAt + 1;
+      search = copied;
+      continue;
+    }
+    // No usable '@': resume at the segment end so this segment is not
+    // rescanned, while still considering a ':' that starts a nested '://'.
+    search = Math.max(proto + 1, end - 1);
+  }
+  if (copied === 0) return text;
+  return out + text.slice(copied);
 }
 
 /**

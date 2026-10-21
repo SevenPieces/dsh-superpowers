@@ -424,3 +424,175 @@ test('F redactCredentials masks URL userinfo in a diagnostic line', () => {
   const plain = 'fatal: not a git repository (or any of the parent directories)';
   assert.equal(redactCredentials(plain), plain, 'a line without credentials is unchanged');
 });
+
+// ---------------------------------------------------------------------------
+// R5-F1 — redactCredentials stays linear for text that cannot hold a credential
+// ---------------------------------------------------------------------------
+
+test('R5-F1: redactCredentials keeps its output for real userinfo and plain text', () => {
+  const redactCredentials = binModule.redactCredentials;
+  assert.equal(
+    redactCredentials('fatal: https://user:secret@host.example/repo.git/: 401'),
+    'fatal: https://***@host.example/repo.git/: 401',
+    'real userinfo is still masked exactly',
+  );
+  assert.equal(
+    redactCredentials('ssh://git@host.example/repo'),
+    'ssh://***@host.example/repo',
+    'ssh userinfo is still masked',
+  );
+  assert.equal(
+    redactCredentials('fatal: not a git repository (or any of the parent directories)'),
+    'fatal: not a git repository (or any of the parent directories)',
+    'plain text is unchanged',
+  );
+});
+
+test('R5-F1: redactCredentials returns 1 MiB credential-free text unchanged in under 1 s', () => {
+  const LF = String.fromCharCode(10);
+  const binUrl = pathToFileURL(BIN).href;
+  const script = [
+    'const { redactCredentials } = await import(' + JSON.stringify(binUrl) + ');',
+    'const M = 1048576;',
+    'const noScheme = "A".repeat(M);',
+    'const schemeNoAt = "A".repeat(M - 3) + "://";',
+    'const t1 = Date.now(); const out1 = redactCredentials(noScheme); const ms1 = Date.now() - t1;',
+    'const t2 = Date.now(); const out2 = redactCredentials(schemeNoAt); const ms2 = Date.now() - t2;',
+    'process.stdout.write(JSON.stringify({',
+    '  noScheme: { length: out1.length, unchanged: out1 === noScheme, hasScheme: noScheme.includes("://"), hasAt: noScheme.includes("@"), ms: ms1 },',
+    '  schemeNoAt: { length: out2.length, unchanged: out2 === schemeNoAt, hasScheme: schemeNoAt.includes("://"), hasAt: schemeNoAt.includes("@"), ms: ms2 },',
+    '}));',
+  ].join(LF);
+
+  // Hard timeout: on the pre-fix implementation the regex is quadratic and this
+  // probe would otherwise run for minutes.
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    encoding: 'utf8',
+    timeout: 12000,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  assert.equal(child.error?.code, undefined, 'the probe completes within the hard timeout: ' + (child.error?.message ?? ''));
+  assert.equal(child.status, 0, 'the probe exits 0: ' + child.stderr);
+
+  const result = JSON.parse(child.stdout);
+  assert.deepEqual(
+    {
+      length: result.noScheme.length,
+      unchanged: result.noScheme.unchanged,
+      hasScheme: result.noScheme.hasScheme,
+      hasAt: result.noScheme.hasAt,
+    },
+    { length: 1048576, unchanged: true, hasScheme: false, hasAt: false },
+    'a 1 MiB string without "://" is returned unchanged',
+  );
+  assert.ok(result.noScheme.ms < 1000, 'the no-:// fast path stays under 1 s; ' + result.noScheme.ms + ' ms');
+  assert.deepEqual(
+    {
+      length: result.schemeNoAt.length,
+      unchanged: result.schemeNoAt.unchanged,
+      hasScheme: result.schemeNoAt.hasScheme,
+      hasAt: result.schemeNoAt.hasAt,
+    },
+    { length: 1048576, unchanged: true, hasScheme: true, hasAt: false },
+    'a 1 MiB string with "://" but no "@" is returned unchanged',
+  );
+  assert.ok(result.schemeNoAt.ms < 1000, 'the no-@ fast path stays under 1 s; ' + result.schemeNoAt.ms + ' ms');
+});
+
+// ---------------------------------------------------------------------------
+// R5-F1 (round 7) — linear redaction, semantically identical to the old regex
+// ---------------------------------------------------------------------------
+
+/** The pre-round-7 regex, kept only as a frozen oracle for small fixtures. */
+function oldRedact(text) {
+  return text.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/]+@/g, '$1***@');
+}
+
+test('R5-F1: redactCredentials matches the old URL_USERINFO regex on small fixtures', () => {
+  const redactCredentials = binModule.redactCredentials;
+  const fixtures = [
+    'fatal: https://user:secret@host.example/repo.git/: 401',
+    'clone https://user:pass@host/a and https://x:y@host/b failed',
+    'https://user:p@ss@host/x',
+    'https://user:p@ss@h/a https://v:w@x/y',
+    'https://host.example/repo',
+    'https://user:pass@host:8443/p',
+    'http://u:p@h:1/a@b/c',
+    'x.y+z://user:pw@host/p',
+    'ssh://git@host.example/repo',
+    'git@github.com:obra/superpowers.git',
+    'mailto:user@example.com',
+    'see https://host/p?x=a@b',
+    '//user:pass@host/p',
+    'a://@host',
+    'plain text without any url',
+    '',
+  ];
+
+  for (const fixture of fixtures) {
+    assert.equal(
+      redactCredentials(fixture),
+      oldRedact(fixture),
+      'redaction must equal the old oracle for ' + JSON.stringify(fixture),
+    );
+  }
+
+  // Pin a few semantics explicitly, so the oracle is not the only check.
+  assert.equal(redactCredentials('https://user:p@ss@host/x'), 'https://***@host/x', 'a password containing @ is masked whole');
+  assert.equal(redactCredentials('//user:pass@host/p'), '//user:pass@host/p', 'a protocol-relative string has no scheme and is unchanged');
+  assert.equal(redactCredentials('a://@host'), 'a://@host', 'an empty userinfo is not a match');
+});
+
+test('R5-F1: redactCredentials stays linear on MiB-scale credential-like, many-:// and credential-free text', () => {
+  const LF = String.fromCharCode(10);
+  const binUrl = pathToFileURL(BIN).href;
+  const script = [
+    'const { redactCredentials } = await import(' + JSON.stringify(binUrl) + ');',
+    'const M = 1048576;',
+    'const userinfo = "A://user:pass@" + "A".repeat(M);',
+    'const manySchemes = "a://".repeat(Math.floor((M - 1) / 4)) + "@";',
+    'const clean = "A".repeat(M);',
+    'const t1 = Date.now(); const o1 = redactCredentials(userinfo); const ms1 = Date.now() - t1;',
+    'const t2 = Date.now(); const o2 = redactCredentials(manySchemes); const ms2 = Date.now() - t2;',
+    'const t3 = Date.now(); const o3 = redactCredentials(clean); const ms3 = Date.now() - t3;',
+    'process.stdout.write(JSON.stringify({',
+    '  userinfo: { ms: ms1, length: o1.length, masked: o1 !== userinfo && o1.includes("***@"), passwordGone: !o1.includes("user:pass"), exact: o1 === "A://***@" + "A".repeat(M) },',
+    '  manySchemes: { ms: ms2, length: manySchemes.length, unchanged: o2 === manySchemes },',
+    '  clean: { ms: ms3, length: o3.length, unchanged: o3 === clean },',
+    '}));',
+  ].join(LF);
+
+  // Hard timeout: the pre-fix regex is quadratic on the credential-like case and
+  // would otherwise stall the suite for minutes.
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    encoding: 'utf8',
+    timeout: 15000,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  assert.equal(child.error?.code, undefined, 'the heavy probe completes within the hard timeout: ' + (child.error?.message ?? ''));
+  assert.equal(child.status, 0, 'the heavy probe exits 0: ' + child.stderr);
+
+  const result = JSON.parse(child.stdout);
+  // Fixture is the 'A://user:pass@' prefix plus a 1 MiB body; masking replaces
+  // 'user:pass' (9 chars) with '***' (3), so output length is M + len('A://***@').
+  assert.equal(
+    result.userinfo.length,
+    1048576 + 'A://***@'.length,
+    'only the userinfo is replaced by ***@',
+  );
+  assert.equal(result.userinfo.masked, true, 'the credential-like fixture is masked');
+  assert.equal(result.userinfo.passwordGone, true, 'the password never survives');
+  assert.equal(result.userinfo.exact, true, 'the masked output matches the oracle exactly');
+  assert.ok(result.userinfo.ms < 200, 'a 1 MiB credential-like line masks in <200 ms; ' + result.userinfo.ms + ' ms');
+
+  assert.ok(
+    result.manySchemes.length >= 1048576 - 8 && result.manySchemes.length <= 1048576,
+    'the many-:// fixture is about 1 MiB; got ' + result.manySchemes.length,
+  );
+  assert.equal(result.manySchemes.unchanged, true, 'many "://" with one unrelated "@" has no userinfo to mask');
+  assert.ok(result.manySchemes.ms < 500, 'the many-:// 1 MiB fixture completes in <500 ms; ' + result.manySchemes.ms + ' ms');
+
+  assert.equal(result.clean.length, 1048576, 'the credential-free fixture is 1 MiB');
+  assert.equal(result.clean.unchanged, true, 'credential-free text is returned unchanged');
+  assert.ok(result.clean.ms < 100, 'credential-free 1 MiB completes in <100 ms; ' + result.clean.ms + ' ms');
+});

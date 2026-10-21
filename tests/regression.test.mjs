@@ -867,3 +867,59 @@ test('R4-F1: below-cap newline-dense output is replayed in chunks without stream
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// R5-F1 (round 6): a huge single-line git error must fail fast with the clean
+// clone diagnostic, not spend quadratic time inside credential redaction.
+
+/** A POSIX fake 'git' that emits one long stderr line (no newline), then fails. */
+function makeLongLineGitShim(root, byteCount) {
+  const shimDir = join(root, 'shim');
+  mkdirSync(shimDir);
+  const shimPath = join(shimDir, 'git');
+  writeFileSync(
+    shimPath,
+    '#!/bin/sh' + LF + "printf '%*s' " + byteCount + " '' | tr ' ' 'A' >&2" + LF + 'exit 1' + LF,
+  );
+  chmodSync(shimPath, 0o755);
+  return { shimDir };
+}
+
+test('R5-F1: a 512 KiB single-line git error fails fast with the clean clone diagnostic', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-sp-longline-'));
+  try {
+    const { shimDir } = makeLongLineGitShim(root, 512 * 1024);
+    const vendor = join(root, 'fresh', 'vendor');
+    const repoUrl = 'file://' + join(root, 'unused.git');
+
+    const started = Date.now();
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', updateSkillsChildScript()], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: shimDir + ':' + process.env.PATH,
+        VENDOR_DIR: vendor,
+        REMOTE_URL: repoUrl,
+      },
+      // Hard timeout: the pre-fix redaction is quadratic on this 512 KiB line
+      // and would otherwise stall the run for minutes.
+      timeout: 12000,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    const elapsed = Date.now() - started;
+    const combined = (child.stdout ?? '') + (child.stderr ?? '');
+
+    assert.notEqual(child.error?.code, 'ETIMEDOUT', 'the run must not hit the hard timeout: ' + (child.error?.message ?? ''));
+    assert.equal(child.status, 7, 'the child caught the error and exited on its own: ' + JSON.stringify(combined.slice(0, 300)));
+    assert.match(
+      child.stdout ?? '',
+      /MARKER:CAUGHT:git clone failed \(/,
+      'the caught error is the clean clone diagnostic: ' + JSON.stringify((child.stdout ?? '').slice(0, 200)),
+    );
+    assert.ok(!combined.includes('EINVAL'), 'no stream error: ' + JSON.stringify(combined.slice(0, 200)));
+    assert.ok(!combined.includes("Unhandled 'error' event"), 'no unhandled stream error: ' + JSON.stringify(combined.slice(0, 200)));
+    assert.ok(!existsSync(join(vendor, '.git')), 'no checkout is left behind');
+    assert.ok(elapsed < 5000, 'the whole run finishes in <5 s; elapsed ' + elapsed + 'ms');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
