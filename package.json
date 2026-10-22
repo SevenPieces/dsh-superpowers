@@ -1,6 +1,6 @@
 {
   "name": "dsh-superpowers",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Superpowers skills port for DSH: plugin-registered skill provider + assembly-time system-prompt bootstrap section",
   "type": "module",
   "main": "lib/index.js",
